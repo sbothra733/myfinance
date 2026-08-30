@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect, useContext, createContext } from "react";
+import { supabase } from "./supabaseClient";
 
 // ---------- helpers ----------
 const uid = (() => {
@@ -318,33 +319,20 @@ export default function InvestmentPlanner() {
     if (!symbol) return;
     setFetchStatus((f) => ({ ...f, [id]: { state: "loading" } }));
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData?.session?.access_token;
+      const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/lookup-share`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          messages: [
-            {
-              role: "user",
-              content: `Look up the current stock price and dividend details for the ticker symbol "${symbol}". Check stockanalysis.com first (its quote page for this ticker, which is free and has no paywall); if that doesn't have it, try finance.yahoo.com, then another reliable free financial data source. Respond with ONLY a JSON object, no markdown fences, no explanation, in exactly this shape:
-{"found": true or false, "companyName": string, "price": number, "quarterlyDividendPerShare": number, "asOf": string, "source": string}
-If the ticker doesn't exist or can't be found, set "found": false. If the company pays no dividend, set "quarterlyDividendPerShare": 0. "asOf" should be a short description of how recent the data is (e.g. "Jul 25 2026 close"). "source" should name the site the data actually came from.`,
-            },
-          ],
-          tools: [{ type: "web_search_20250305", name: "web_search" }],
-        }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token || import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({ symbol }),
       });
-      const data = await response.json();
-      const text = (data.content || [])
-        .map((block) => (block.type === "text" ? block.text : ""))
-        .filter(Boolean)
-        .join("\n");
-      const cleaned = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
+      const parsed = await response.json();
 
-      if (!parsed.found) {
-        setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: "Ticker not found" } }));
+      if (!response.ok || !parsed.found) {
+        setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: parsed?.error || "Ticker not found" } }));
         return;
       }
 
@@ -360,7 +348,8 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
         )
       );
       const sourceLabel = parsed.source ? `${parsed.source} · ${parsed.asOf || ""}`.trim() : parsed.asOf || "Updated";
-      setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: sourceLabel } }));
+      const noteSuffix = parsed.quarterlyDividendPerShare === 0 && parsed.dividendNote ? ` (dividend: ${parsed.dividendNote})` : "";
+      setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: sourceLabel + noteSuffix } }));
     } catch (err) {
       setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: "Couldn't fetch — enter manually" } }));
     }
@@ -441,6 +430,24 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
     setSsTaxRate(d.ssTaxRate ?? "15");
   };
 
+  // Restore an existing Supabase session on load (e.g. page refresh) instead of forcing a fresh
+  // login every time — Supabase's client persists the session in localStorage on its own.
+  useEffect(() => {
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user) {
+        setCurrentProfile({ profileId: session.user.id, email: session.user.email });
+        setAuthStage("in");
+      }
+    })();
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        setCurrentProfile({ profileId: session.user.id, email: session.user.email });
+      }
+    });
+    return () => authListener.subscription.unsubscribe();
+  }, []);
+
   useEffect(() => {
     if (!currentProfile) {
       setAccounts([]);
@@ -449,8 +456,13 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
     }
     (async () => {
       try {
-        const res = await window.storage.get(`accounts-index:${currentProfile.profileId}`, false);
-        setAccounts(res ? JSON.parse(res.value) : []);
+        const { data, error } = await supabase
+          .from("accounts")
+          .select("id, name, updated_at")
+          .eq("user_id", currentProfile.profileId)
+          .order("updated_at", { ascending: false });
+        if (error) throw error;
+        setAccounts((data || []).map((a) => ({ id: a.id, name: a.name, updatedAt: new Date(a.updated_at).getTime() })));
       } catch (e) {
         setAccounts([]);
       } finally {
@@ -459,30 +471,24 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
     })();
   }, [currentProfile]);
 
-  const persistAccountsIndex = async (list) => {
-    if (!currentProfile) return;
-    try {
-      await window.storage.set(`accounts-index:${currentProfile.profileId}`, JSON.stringify(list), false);
-    } catch (e) {
-      // best-effort
-    }
-  };
-
   const doSaveAccount = async (overrideSnapshotDate) => {
     if (!currentProfile || !activeAccountId) return;
     setAccountStatus("Saving…");
     try {
       const data = serializeProfile();
       if (overrideSnapshotDate) data.snapshotDate = overrideSnapshotDate;
-      await window.storage.set(`account:${currentProfile.profileId}:${activeAccountId}`, JSON.stringify(data), false);
-      const updated = accounts.map((a) => (a.id === activeAccountId ? { ...a, updatedAt: Date.now() } : a));
-      setAccounts(updated);
-      await persistAccountsIndex(updated);
+      const { error } = await supabase
+        .from("accounts")
+        .update({ data, updated_at: new Date().toISOString() })
+        .eq("id", activeAccountId)
+        .eq("user_id", currentProfile.profileId);
+      if (error) throw error;
+      setAccounts((prev) => prev.map((a) => (a.id === activeAccountId ? { ...a, updatedAt: Date.now() } : a)));
       if (overrideSnapshotDate) setSnapshotDate(overrideSnapshotDate);
       setAccountStatus("Saved");
       setTimeout(() => setAccountStatus(""), 2500);
     } catch (e) {
-      setAccountStatus("Couldn't save");
+      setAccountStatus(`Couldn't save: ${e?.message || "unknown error"}`);
     }
   };
 
@@ -516,24 +522,25 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
     }
     const name = newAccountName.trim();
     if (!name) return;
-    const id = uid();
-    const entry = { id, name, updatedAt: Date.now() };
-    const updated = [...accounts, entry];
     setAccountStatus("Creating…");
     try {
       const freshSnapshotDate = todayStr();
       const data = { ...serializeProfile(), snapshotDate: freshSnapshotDate };
-      await window.storage.set(`account:${currentProfile.profileId}:${id}`, JSON.stringify(data), false);
-      await persistAccountsIndex(updated);
-      setAccounts(updated);
-      setActiveAccountId(id);
+      const { data: inserted, error } = await supabase
+        .from("accounts")
+        .insert({ user_id: currentProfile.profileId, name, data })
+        .select("id, name, updated_at")
+        .single();
+      if (error) throw error;
+      setAccounts((prev) => [{ id: inserted.id, name: inserted.name, updatedAt: new Date(inserted.updated_at).getTime() }, ...prev]);
+      setActiveAccountId(inserted.id);
       setSnapshotDate(freshSnapshotDate);
       setNewAccountName("");
       setShowNewAccountInput(false);
       setAccountStatus("Account created");
       setTimeout(() => setAccountStatus(""), 2500);
     } catch (e) {
-      setAccountStatus("Couldn't create account");
+      setAccountStatus(`Couldn't create account: ${e?.message || "unknown error"}`);
     }
   };
 
@@ -545,48 +552,18 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
     if (!currentProfile) return;
     setAccountStatus("Loading…");
     try {
-      const res = await window.storage.get(`account:${currentProfile.profileId}:${id}`, false);
-      applyProfile(res ? JSON.parse(res.value) : {});
+      const { data, error } = await supabase
+        .from("accounts")
+        .select("data")
+        .eq("id", id)
+        .eq("user_id", currentProfile.profileId)
+        .single();
+      if (error) throw error;
+      applyProfile(data?.data || {});
       setActiveAccountId(id);
       setAccountStatus("");
     } catch (e) {
       setAccountStatus("Couldn't load account");
-    }
-  };
-
-  // ---------- password hashing (client-side, salted SHA-256 — not bank-grade, but never stores plaintext) ----------
-  const toHex = (buffer) => Array.from(new Uint8Array(buffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
-
-  const hashPassword = async (password, existingSaltHex) => {
-    const salt = existingSaltHex || toHex(crypto.getRandomValues(new Uint8Array(16)).buffer);
-    const enc = new TextEncoder();
-    const digest = await crypto.subtle.digest("SHA-256", enc.encode(`${salt}:${password}`));
-    return { hash: toHex(digest), salt };
-  };
-
-  const safeGetStorage = async (key) => {
-    try {
-      const res = await window.storage.get(key, false);
-      return res ? res.value : null;
-    } catch (e) {
-      return null;
-    }
-  };
-
-  // Distinguishes "storage works but this key doesn't exist yet" (normal) from "storage isn't
-  // reachable at all" (a real problem) — safeGetStorage above can't tell these apart, which is
-  // exactly what made storage outages look identical to "no account found."
-  const checkStorageAvailable = async () => {
-    try {
-      if (!window.storage || typeof window.storage.set !== "function" || typeof window.storage.get !== "function") {
-        return { ok: false, detail: "window.storage is not available in this session." };
-      }
-      const probeKey = "__storage_check__";
-      await window.storage.set(probeKey, String(Date.now()), false);
-      await window.storage.get(probeKey, false);
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, detail: e?.message || String(e) };
     }
   };
 
@@ -608,25 +585,23 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
       return;
     }
     setAuthBusy(true);
-    const storageCheck = await checkStorageAvailable();
-    if (!storageCheck.ok) {
-      setAuthError(`This device/browser can't reach the app's storage right now, so no profile can be created. Try refreshing the page or reopening the app. (Detail: ${storageCheck.detail})`);
-      setAuthBusy(false);
-      return;
-    }
     try {
-      const indexRaw = await safeGetStorage("profiles-index");
-      const list = indexRaw ? JSON.parse(indexRaw) : [];
-      if (list.find((p) => p.email === email)) {
-        setAuthError("A profile already exists for this email — try logging in instead.");
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password: authPassword,
+        // Explicitly point the confirmation-email link at wherever this app is actually running
+        // (localhost during dev, your real domain in production), rather than relying solely on
+        // Supabase's static "Site URL" setting, which is easy to leave pointed at localhost.
+        options: { emailRedirectTo: window.location.origin },
+      });
+      if (error) throw error;
+      if (!data.session) {
+        // Email confirmation is enabled on the Supabase project — see README's note on Site URL / Redirect URLs.
+        setAuthError("Account created. Check your email to confirm it, then log in.");
         setAuthBusy(false);
         return;
       }
-      const { hash, salt } = await hashPassword(authPassword);
-      const profileId = uid();
-      await window.storage.set(`profile:${profileId}`, JSON.stringify({ email, passwordHash: hash, salt, createdAt: Date.now() }), false);
-      await window.storage.set("profiles-index", JSON.stringify([...list, { profileId, email }]), false);
-      setCurrentProfile({ profileId, email });
+      setCurrentProfile({ profileId: data.user.id, email: data.user.email });
       setAuthStage("in");
       setAuthPassword("");
       setAuthPassword2("");
@@ -646,46 +621,22 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
       return;
     }
     setAuthBusy(true);
-    const storageCheck = await checkStorageAvailable();
-    if (!storageCheck.ok) {
-      setAuthError(`This device/browser can't reach the app's storage right now, so it can't check for your profile. This is different from "no account found" — try refreshing the page or reopening the app. (Detail: ${storageCheck.detail})`);
-      setAuthBusy(false);
-      return;
-    }
     try {
-      const indexRaw = await safeGetStorage("profiles-index");
-      const list = indexRaw ? JSON.parse(indexRaw) : [];
-      const entry = list.find((p) => p.email === email);
-      if (!entry) {
-        setAuthError("No profile found for this email on this device. If you created it elsewhere, storage doesn't sync across devices/browsers — use Import profile (once logged in on this device) with an exported JSON backup instead.");
-        setAuthBusy(false);
-        return;
-      }
-      const profRaw = await safeGetStorage(`profile:${entry.profileId}`);
-      const prof = profRaw ? JSON.parse(profRaw) : null;
-      if (!prof) {
-        setAuthError("Profile data missing — try signing up again.");
-        setAuthBusy(false);
-        return;
-      }
-      const { hash } = await hashPassword(authPassword, prof.salt);
-      if (hash !== prof.passwordHash) {
-        setAuthError("Incorrect password.");
-        setAuthBusy(false);
-        return;
-      }
-      setCurrentProfile({ profileId: entry.profileId, email });
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password: authPassword });
+      if (error) throw error;
+      setCurrentProfile({ profileId: data.user.id, email: data.user.email });
       setAuthStage("in");
       setAuthPassword("");
       setAuthEmail("");
     } catch (e) {
-      setAuthError("Couldn't log in.");
+      setAuthError(e?.message || "Couldn't log in.");
     } finally {
       setAuthBusy(false);
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    await supabase.auth.signOut();
     setCurrentProfile(null);
     setAuthStage("none");
     setAuthMode("login");
@@ -706,19 +657,14 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
       return;
     }
     try {
-      const profRaw = await safeGetStorage(`profile:${currentProfile.profileId}`);
-      const prof = profRaw ? JSON.parse(profRaw) : null;
-      if (!prof) {
-        setChangeStatus("Profile not found.");
-        return;
-      }
-      const { hash: oldHash } = await hashPassword(changeOld, prof.salt);
-      if (oldHash !== prof.passwordHash) {
+      // Re-verify the current password by signing in again before allowing the change.
+      const { error: verifyError } = await supabase.auth.signInWithPassword({ email: currentProfile.email, password: changeOld });
+      if (verifyError) {
         setChangeStatus("Current password is incorrect.");
         return;
       }
-      const { hash, salt } = await hashPassword(changeNew);
-      await window.storage.set(`profile:${currentProfile.profileId}`, JSON.stringify({ ...prof, passwordHash: hash, salt }), false);
+      const { error } = await supabase.auth.updateUser({ password: changeNew });
+      if (error) throw error;
       setChangeStatus("Password updated.");
       setChangeOld("");
       setChangeNew("");
@@ -728,7 +674,7 @@ If the ticker doesn't exist or can't be found, set "found": false. If the compan
         setChangeStatus("");
       }, 1500);
     } catch (e) {
-      setChangeStatus("Couldn't update password.");
+      setChangeStatus(`Couldn't update password: ${e?.message || "unknown error"}`);
     }
   };
 
