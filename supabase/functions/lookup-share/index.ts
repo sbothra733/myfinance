@@ -5,12 +5,13 @@
 //   supabase functions deploy lookup-share
 //   supabase secrets set FINNHUB_API_KEY=your_key_here
 //
-// Finnhub's free tier (60 req/min, US-listed stocks) covers /quote reliably. The dividend
-// endpoint below (/stock/dividend2) is Finnhub's "basic" dividend data — double-check
-// https://finnhub.io/docs/api for the current endpoint name/shape before relying on it,
-// since third-party API surfaces do change. If it fails or isn't available on your plan,
-// this function still returns the price and simply reports the dividend as 0, so lookups
-// keep working — you'd just need to enter the dividend manually in that case.
+// Finnhub's free tier (60 req/min, US-listed stocks) covers /quote reliably. Dividend data is
+// less certain on the free tier, so this tries two sources in order:
+//   1. /stock/dividend2 — actual payment history, most accurate when available.
+//   2. /stock/metric (basic financials, definitely free-tier) — falls back to the trailing
+//      annual dividend-per-share figure divided by 4, if the first source returns nothing.
+// If both come up empty, quarterlyDividendPerShare is 0 and `dividendNote` explains why —
+// check that note if dividends keep showing as 0 for stocks you know pay one.
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -53,6 +54,9 @@ Deno.serve(async (req) => {
     }
 
     let quarterlyDividendPerShare = 0;
+    let dividendNote = "";
+
+    // Source 1: actual dividend payment history.
     try {
       const to = new Date();
       const from = new Date();
@@ -64,14 +68,40 @@ Deno.serve(async (req) => {
         const divData = await divRes.json();
         const payments = Array.isArray(divData) ? divData : divData?.data || [];
         if (payments.length > 0) {
-          // Most recent payment's per-share amount, as a stand-in for "quarterly" — adjust here if your
-          // plan's response shape differs, or if the company pays on a non-quarterly schedule.
           const latest = payments[0];
-          quarterlyDividendPerShare = Number(latest.amount ?? latest.dividend ?? 0) || 0;
+          const amt = Number(latest.amount ?? latest.dividend ?? 0) || 0;
+          if (amt > 0) {
+            quarterlyDividendPerShare = amt;
+            dividendNote = "from payment history";
+          }
         }
+      } else if (divRes.status === 403) {
+        dividendNote = "payment history endpoint requires a paid Finnhub plan; tried basic financials instead";
       }
     } catch (_e) {
-      // Dividend lookup is best-effort — price is the important part, so don't fail the whole request.
+      // fall through to source 2
+    }
+
+    // Source 2: basic financials (trailing annual dividend / 4), definitely available on the free tier.
+    if (quarterlyDividendPerShare === 0) {
+      try {
+        const metricRes = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${cleanSymbol}&metric=all&token=${apiKey}`);
+        if (metricRes.ok) {
+          const metricData = await metricRes.json();
+          const annualDividend =
+            Number(metricData?.metric?.dividendPerShareAnnual) ||
+            Number(metricData?.metric?.["dividendPerShareTTM"]) ||
+            0;
+          if (annualDividend > 0) {
+            quarterlyDividendPerShare = annualDividend / 4;
+            dividendNote = "estimated from trailing annual dividend (basic financials)";
+          } else if (!dividendNote) {
+            dividendNote = "no dividend data found for this ticker";
+          }
+        }
+      } catch (_e) {
+        if (!dividendNote) dividendNote = "dividend lookup failed";
+      }
     }
 
     return new Response(
@@ -79,6 +109,7 @@ Deno.serve(async (req) => {
         found: true,
         price: quote.c,
         quarterlyDividendPerShare,
+        dividendNote,
         asOf: new Date().toLocaleDateString(),
         source: "Finnhub",
       }),

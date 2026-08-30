@@ -82,20 +82,42 @@ function Field({ label, suffix, className = "", children }) {
   );
 }
 
-function MoneyInput({ value, onChange, placeholder = "0" }) {
+function MoneyInput({ value, onChange, placeholder = "0", decimals = 0 }) {
   const { symbol } = useContext(CurrencyContext);
-  // Comma-grouped, whole-number display — digits only while typing, formatted with thousands separators.
-  const displayValue = value === "" || value === null || value === undefined ? "" : Number(value).toLocaleString("en-US", { maximumFractionDigits: 0 });
+  // Comma-grouped display — whole numbers by default; pass decimals={2} for fields (like share
+  // price or dividend per share) where cents actually matter. Formats the whole-number part with
+  // commas while preserving the fractional part exactly as typed (so "24." doesn't collapse back
+  // to "24" mid-keystroke, which a naive Number().toLocaleString() round-trip would cause).
+  const displayValue = (() => {
+    if (value === "" || value === null || value === undefined) return "";
+    if (decimals === 0) return Number(value).toLocaleString("en-US", { maximumFractionDigits: 0 });
+    const str = String(value);
+    const [wholePart, fracPart] = str.split(".");
+    const wholeFormatted = (parseInt(wholePart, 10) || 0).toLocaleString("en-US");
+    return fracPart !== undefined ? `${wholeFormatted}.${fracPart}` : wholeFormatted;
+  })();
   const handleChange = (e) => {
-    const digitsOnly = e.target.value.replace(/[^0-9]/g, "");
-    onChange(digitsOnly === "" ? "" : String(parseInt(digitsOnly, 10)));
+    if (decimals > 0) {
+      // allow digits and a single decimal point, capped at `decimals` places after it
+      let raw = e.target.value.replace(/[^0-9.]/g, "");
+      const firstDot = raw.indexOf(".");
+      if (firstDot !== -1) {
+        raw = raw.slice(0, firstDot + 1) + raw.slice(firstDot + 1).replace(/\./g, "");
+        const [whole, frac] = raw.split(".");
+        raw = frac !== undefined ? `${whole}.${frac.slice(0, decimals)}` : raw;
+      }
+      onChange(raw);
+    } else {
+      const digitsOnly = e.target.value.replace(/[^0-9]/g, "");
+      onChange(digitsOnly === "" ? "" : String(parseInt(digitsOnly, 10)));
+    }
   };
   return (
     <div className="money-input">
       <span>{symbol}</span>
       <input
         type="text"
-        inputMode="numeric"
+        inputMode="decimal"
         value={displayValue}
         placeholder={placeholder}
         onChange={handleChange}
@@ -220,7 +242,7 @@ export default function InvestmentPlanner() {
 
   // 4. properties
   const [properties, setProperties] = useState([
-    { id: uid(), label: "Primary residence", type: "self", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", hoa: "", managementFee: "" },
+    { id: uid(), label: "Primary residence", type: "self", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", propertyInsurance: "", hoa: "", managementFee: "" },
   ]);
 
   // 5. shares
@@ -326,7 +348,8 @@ export default function InvestmentPlanner() {
         )
       );
       const sourceLabel = parsed.source ? `${parsed.source} · ${parsed.asOf || ""}`.trim() : parsed.asOf || "Updated";
-      setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: sourceLabel } }));
+      const noteSuffix = parsed.quarterlyDividendPerShare === 0 && parsed.dividendNote ? ` (dividend: ${parsed.dividendNote})` : "";
+      setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: sourceLabel + noteSuffix } }));
     } catch (err) {
       setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: "Couldn't fetch — enter manually" } }));
     }
@@ -335,7 +358,7 @@ export default function InvestmentPlanner() {
   const addProperty = () =>
     setProperties((p) => [
       ...p,
-      { id: uid(), label: `Property ${p.length + 1}`, type: "rental", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", hoa: "", managementFee: "" },
+      { id: uid(), label: `Property ${p.length + 1}`, type: "rental", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", propertyInsurance: "", hoa: "", managementFee: "" },
     ]);
   const removeProperty = (id) => setProperties((p) => p.filter((x) => x.id !== id));
   const updateProperty = (id, key, val) => setProperties((p) => p.map((x) => (x.id === id ? { ...x, [key]: val } : x)));
@@ -381,7 +404,7 @@ export default function InvestmentPlanner() {
     setProperties(
       d.properties && d.properties.length
         ? d.properties
-        : [{ id: uid(), label: "Primary residence", type: "self", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", hoa: "", managementFee: "" }]
+        : [{ id: uid(), label: "Primary residence", type: "self", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", propertyInsurance: "", hoa: "", managementFee: "" }]
     );
     setShares(d.shares && d.shares.length ? d.shares : [{ id: uid(), ticker: "", quantity: "", price: "", dividendValue: "" }]);
     setSharesReturn(d.sharesReturn ?? "7");
@@ -563,10 +586,17 @@ export default function InvestmentPlanner() {
     }
     setAuthBusy(true);
     try {
-      const { data, error } = await supabase.auth.signUp({ email, password: authPassword });
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password: authPassword,
+        // Explicitly point the confirmation-email link at wherever this app is actually running
+        // (localhost during dev, your real domain in production), rather than relying solely on
+        // Supabase's static "Site URL" setting, which is easy to leave pointed at localhost.
+        options: { emailRedirectTo: window.location.origin },
+      });
       if (error) throw error;
       if (!data.session) {
-        // Email confirmation is likely enabled on the Supabase project — see README.
+        // Email confirmation is enabled on the Supabase project — see README's note on Site URL / Redirect URLs.
         setAuthError("Account created. Check your email to confirm it, then log in.");
         setAuthBusy(false);
         return;
@@ -748,9 +778,10 @@ export default function InvestmentPlanner() {
     const totalPropertyEquity = totalPropertyValue - totalPropertyLoans;
     const totalMortgagePayments = properties.reduce((s, p) => s + num(p.monthlyMortgage), 0);
     const totalPropertyTax = properties.reduce((s, p) => s + num(p.propertyTax), 0);
+    const totalPropertyInsurance = properties.reduce((s, p) => s + num(p.propertyInsurance), 0);
     const totalHoa = properties.reduce((s, p) => s + num(p.hoa), 0);
     const totalManagementFees = properties.reduce((s, p) => s + num(p.managementFee), 0);
-    const totalPropertyCarryCosts = totalPropertyTax + totalHoa + totalManagementFees;
+    const totalPropertyCarryCosts = totalPropertyTax + totalPropertyInsurance + totalHoa + totalManagementFees;
     const totalRentalIncome = properties
       .filter((p) => p.type === "rental")
       .reduce((s, p) => s + num(p.rentalIncome), 0);
@@ -1194,7 +1225,7 @@ export default function InvestmentPlanner() {
     return {
       totalCds, weightedCdRate, liquid,
       rdComputed, totalRDCurrentValue, totalRDMaturityValue, totalRDMonthlyDeposit, weightedRDRate,
-      totalPropertyValue, totalPropertyLoans, totalPropertyEquity, totalMortgagePayments, totalPropertyTax, totalHoa, totalManagementFees, totalPropertyCarryCosts, totalRentalIncome,
+      totalPropertyValue, totalPropertyLoans, totalPropertyEquity, totalMortgagePayments, totalPropertyTax, totalPropertyInsurance, totalHoa, totalManagementFees, totalPropertyCarryCosts, totalRentalIncome,
       totalShares, totalQuarterlyDividendIncome, totalAnnualDividendIncome, monthlyDividendIncome, totalLoanBalance, totalLoanPayments, highInterestLoans,
       totalExpenses, netWorth, afterTax, monthlyInflow, monthlyOutflow, monthlyCashFlow, savingsRate,
       emergencyTarget, emergencyCurrent, emergencyGap, emMonths, plan,
@@ -2707,8 +2738,8 @@ export default function InvestmentPlanner() {
               <p className="section-hint">
                 Mark each as self-occupied or rental. Value is used to estimate equity.{" "}
                 {country === "India"
-                  ? "Property tax and maintenance are counted as monthly carrying costs; rental income is added to monthly cash flow."
-                  : "Property tax, HOA, and (for rentals) management fees are all counted as monthly carrying costs; rental income is added to monthly cash flow."}
+                  ? "Property tax, insurance, and maintenance are counted as monthly carrying costs; rental income is added to monthly cash flow."
+                  : "Property tax, insurance, HOA, and (for rentals) management fees are all counted as monthly carrying costs; rental income is added to monthly cash flow."}
               </p>
               {properties.map((p) => (
                 <RowShell key={p.id} onRemove={() => removeProperty(p.id)}>
@@ -2735,6 +2766,9 @@ export default function InvestmentPlanner() {
                   </Field>
                   <Field label="Property tax" suffix="monthly">
                     <MoneyInput value={p.propertyTax} onChange={(v) => updateProperty(p.id, "propertyTax", v)} />
+                  </Field>
+                  <Field label="Property insurance" suffix="monthly">
+                    <MoneyInput value={p.propertyInsurance} onChange={(v) => updateProperty(p.id, "propertyInsurance", v)} placeholder="e.g. 100" />
                   </Field>
                   {country !== "India" && (
                     <Field label="HOA" suffix="monthly">
@@ -2809,10 +2843,10 @@ export default function InvestmentPlanner() {
                       />
                     </Field>
                     <Field label="Market price / share">
-                      <MoneyInput value={h.price} onChange={(v) => updateShare(h.id, "price", v)} />
+                      <MoneyInput value={h.price} onChange={(v) => updateShare(h.id, "price", v)} decimals={2} />
                     </Field>
                     <Field label="Dividend per share" suffix="quarterly" className="full-width">
-                      <MoneyInput value={h.dividendValue} onChange={(v) => updateShare(h.id, "dividendValue", v)} />
+                      <MoneyInput value={h.dividendValue} onChange={(v) => updateShare(h.id, "dividendValue", v)} decimals={2} />
                     </Field>
                     <div className="holding-readout">
                       <span>Value: <strong>{money(holdingValue)}</strong></span>
