@@ -2,8 +2,8 @@
 //
 // Proxies stock price + dividend lookups to Finnhub (finnhub.io), keeping the API key
 // server-side instead of exposing it in the browser bundle. Deploy with:
-//   supabase functions deploy lookup-share
-//   supabase secrets set FINNHUB_API_KEY=your_key_here
+//   npx supabase functions deploy lookup-share
+//   npx supabase secrets set FINNHUB_API_KEY=your_key_here
 //
 // Finnhub's free tier (60 req/min, US-listed stocks) covers /quote reliably. Dividend data is
 // less certain on the free tier, so this tries two sources in order:

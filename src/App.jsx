@@ -70,6 +70,27 @@ const rdFutureValue = (deposit, annualRatePct, periodsPerYear, nPeriods) => {
   return deposit * ((Math.pow(1 + i, n) - 1) / i) * (1 + i);
 };
 
+// Standard annual-payment amortization (a simplification of monthly amortization, consistent with
+// this app's year-granular projections elsewhere) — used for planned-item loans that specify a tenure.
+const annualLoanInstallment = (principal, annualRatePct, tenureYears) => {
+  const n = Math.max(0, tenureYears);
+  if (n <= 0 || principal <= 0) return 0;
+  const i = annualRatePct / 100;
+  if (i === 0) return principal / n;
+  return (principal * i) / (1 - Math.pow(1 + i, -n));
+};
+// Remaining balance after `yearsElapsed` full annual payments have been made.
+const annualLoanBalanceAfter = (principal, annualRatePct, tenureYears, yearsElapsed) => {
+  const n = Math.max(0, tenureYears);
+  const y = Math.max(0, Math.min(yearsElapsed, n));
+  if (n <= 0 || principal <= 0) return 0;
+  const i = annualRatePct / 100;
+  const installment = annualLoanInstallment(principal, annualRatePct, n);
+  if (i === 0) return Math.max(0, principal - installment * y);
+  const bal = principal * Math.pow(1 + i, y) - installment * ((Math.pow(1 + i, y) - 1) / i);
+  return Math.max(0, bal);
+};
+
 const CurrencyContext = createContext({ code: "USD", symbol: "$" });
 
 // ---------- field primitives ----------
@@ -169,7 +190,7 @@ export default function InvestmentPlanner() {
   const [withdrawalRate, setWithdrawalRate] = useState("4");
   const [propertyAppreciationRate, setPropertyAppreciationRate] = useState("3");
   const [showNetWorthChart, setShowNetWorthChart] = useState(false);
-  const [netWorthYears, setNetWorthYears] = useState("20");
+  const [netWorthYears, setNetWorthYears] = useState("10");
   const CURRENT_INFLATION_RATE = "3.5"; // headline CPI, June 2026 (BLS) — used as the default for growth-rate assumptions below
   const [rentGrowthRate, setRentGrowthRate] = useState(CURRENT_INFLATION_RATE);
   const [expenseGrowthRate, setExpenseGrowthRate] = useState(CURRENT_INFLATION_RATE);
@@ -301,7 +322,7 @@ export default function InvestmentPlanner() {
   const addPlannedItem = () =>
     setPlannedItems((p) => [
       ...p,
-      { id: uid(), label: "", category: "Other", type: "liability", fundingSource: "none", amount: "", year: String(currentYear() + 1) },
+      { id: uid(), label: "", category: "Other", type: "expense", amount: "", year: String(currentYear() + 1), fundingSplits: [{ id: uid(), source: "none", percent: "100", interestRate: "", tenureYears: "" }] },
     ]);
   const removePlannedItem = (id) => {
     setPlannedItems((p) => p.filter((x) => x.id !== id));
@@ -309,6 +330,30 @@ export default function InvestmentPlanner() {
   };
   const updatePlannedItem = (id, key, val) => setPlannedItems((p) => p.map((x) => (x.id === id ? { ...x, [key]: val } : x)));
   const togglePlannedCollapse = (id) => setCollapsedPlannedIds((c) => (c.includes(id) ? c.filter((x) => x !== id) : [...c, id]));
+
+  // Reads funding as a list of splits, transparently upgrading older items saved with a single
+  // fundingSource/interestRate pair (before multi-source funding existed) into an equivalent
+  // one-split array — so old profiles keep working without a data migration step.
+  const getFundingSplits = (item) =>
+    Array.isArray(item.fundingSplits) && item.fundingSplits.length > 0
+      ? item.fundingSplits
+      : [{ id: "legacy", source: item.fundingSource || "none", percent: "100", interestRate: item.interestRate || "" }];
+  const addFundingSplit = (itemId) =>
+    setPlannedItems((p) =>
+      p.map((it) => (it.id === itemId ? { ...it, fundingSplits: [...getFundingSplits(it), { id: uid(), source: "none", percent: "0", interestRate: "", tenureYears: "" }] } : it))
+    );
+  const updateFundingSplit = (itemId, splitId, key, val) =>
+    setPlannedItems((p) =>
+      p.map((it) => (it.id === itemId ? { ...it, fundingSplits: getFundingSplits(it).map((s) => (s.id === splitId ? { ...s, [key]: val } : s)) } : it))
+    );
+  const removeFundingSplit = (itemId, splitId) =>
+    setPlannedItems((p) =>
+      p.map((it) => {
+        if (it.id !== itemId) return it;
+        const remaining = getFundingSplits(it).filter((s) => s.id !== splitId);
+        return { ...it, fundingSplits: remaining.length > 0 ? remaining : [{ id: uid(), source: "none", percent: "100", interestRate: "" }] };
+      })
+    );
 
   const addShare = () => setShares((s) => [...s, { id: uid(), ticker: "", quantity: "", price: "", dividendValue: "" }]);
   const removeShare = (id) => setShares((s) => s.filter((x) => x.id !== id));
@@ -501,8 +546,6 @@ export default function InvestmentPlanner() {
       setShowNewAccountInput(true);
       return;
     }
-    // If the data has moved on from the saved snapshot date, ask before silently rolling "Now" forward —
-    // otherwise just save, since there's nothing to reconcile.
     if (snapshotDate !== todayStr()) {
       setShowSnapshotPrompt(true);
       return;
@@ -589,14 +632,10 @@ export default function InvestmentPlanner() {
       const { data, error } = await supabase.auth.signUp({
         email,
         password: authPassword,
-        // Explicitly point the confirmation-email link at wherever this app is actually running
-        // (localhost during dev, your real domain in production), rather than relying solely on
-        // Supabase's static "Site URL" setting, which is easy to leave pointed at localhost.
         options: { emailRedirectTo: window.location.origin },
       });
       if (error) throw error;
       if (!data.session) {
-        // Email confirmation is enabled on the Supabase project — see README's note on Site URL / Redirect URLs.
         setAuthError("Account created. Check your email to confirm it, then log in.");
         setAuthBusy(false);
         return;
@@ -657,7 +696,6 @@ export default function InvestmentPlanner() {
       return;
     }
     try {
-      // Re-verify the current password by signing in again before allowing the change.
       const { error: verifyError } = await supabase.auth.signInWithPassword({ email: currentProfile.email, password: changeOld });
       if (verifyError) {
         setChangeStatus("Current password is incorrect.");
@@ -1323,14 +1361,35 @@ export default function InvestmentPlanner() {
   ]);
 
   const buildNetWorthTrajectory = (applyPayoffs) => {
-    const years = Math.min(40, Math.max(1, Math.round(num(netWorthYears)) || 20));
+    const years = Math.min(40, Math.max(1, Math.round(num(netWorthYears)) || 10));
     const apprRate = num(propertyAppreciationRate) || 0;
     const cdRate = (num(marketCdRate) || summary.weightedCdRate) / 100; // new CD money earns today's market rate, not necessarily what old CDs happen to carry
-    const rdRate = summary.weightedRDRate / 100;
     const shareReturn = summary.totalExpectedReturn / 100;
 
     let cdsVal = summary.totalCds;
-    let rdVal = summary.totalRDCurrentValue;
+    // Recurring deposits are tracked per account, not as one blended pool — each compounds at its
+    // own rate and receives its own contribution until its own maturity date, which is what makes
+    // the category total mathematically exact rather than an approximation from a single weighted
+    // rate applied to a combined balance.
+    let rdStates = summary.rdComputed.map((r) => ({
+      id: r.id,
+      label: r.label || "Recurring Deposit",
+      value: r.currentValue,
+      rate: num(r.rate),
+      startDate: r.startDate,
+      endDateObj: r.endDateObj,
+      monthlyDepositEquivalent: r.monthlyDepositEquivalent,
+    }));
+    const rdTotal = () => rdStates.reduce((s, r) => s + r.value, 0);
+    const reduceRdProportionally = (amount) => {
+      const total = rdTotal();
+      if (total <= 0 || amount <= 0) return;
+      rdStates = rdStates.map((r) => ({ ...r, value: Math.max(0, r.value - amount * (r.value / total)) }));
+    };
+    const reduceRdAccountById = (accountId, amount) => {
+      if (amount <= 0) return;
+      rdStates = rdStates.map((r) => (r.id === accountId ? { ...r, value: Math.max(0, r.value - amount) } : r));
+    };
     let sharesVal = summary.totalShares;
     let liquidVal = summary.liquid;
     let k401Val = summary.k401Now;
@@ -1340,15 +1399,19 @@ export default function InvestmentPlanner() {
     // plan) until its own tenure ends, then stops — mirrors the cash flow projection's treatment.
     const today = new Date(snapshotDateObj);
     const baseYear = today.getFullYear();
-    const rdContributionAtYear = (y) => {
+    // Grows every RD account for one year: still-active accounts compound at their own rate and
+    // receive their own contribution; matured accounts (past their end date) simply stop changing,
+    // rather than continuing to earn a rate their term no longer applies to.
+    const growRdStatesForYear = (y) => {
       const futureDate = new Date(today);
       futureDate.setFullYear(futureDate.getFullYear() + y);
-      return summary.rdComputed.reduce((s, r) => {
-        if (!r.endDateObj || !r.startDate) return s;
+      rdStates = rdStates.map((r) => {
+        if (!r.endDateObj || !r.startDate) return r;
         const startDateObj = new Date(r.startDate + "T00:00:00");
-        const stillActive = futureDate >= startDateObj && futureDate < r.endDateObj;
-        return s + (stillActive ? r.monthlyDepositEquivalent * 12 : 0);
-      }, 0);
+        if (futureDate >= r.endDateObj) return r; // matured — value stays frozen from here on
+        const contribution = futureDate >= startDateObj ? r.monthlyDepositEquivalent * 12 : 0;
+        return { ...r, value: r.value * (1 + r.rate / 100) + contribution };
+      });
     };
 
     // this year's cash flow surplus, growing income/rent/expenses/property costs from today at their own rates
@@ -1366,16 +1429,57 @@ export default function InvestmentPlanner() {
     // obligations, and those obligations rise with inflation, so the dollar target should too.
     const emergencyTargetAtYear = (y) => summary.emergencyTarget * Math.pow(1 + summary.expenseGrowthPct / 100, Math.max(0, y - 1));
 
-    // planned big items funded by cash or CD hit at their specific year, reducing that pool right away —
-    // this is what can push liquid cash below the emergency target and trigger a refill below.
-    const plannedCashHitAtYear = (y) =>
+    // planned big items funded (in whole or in part) by cash, CD, or recurring deposit hit at their
+    // specific year, reducing that pool right away — this is what can push liquid cash below the
+    // emergency target and trigger a refill below. An item scheduled for this year or earlier is
+    // clamped to year 0 ("Now") so it isn't silently skipped just because the loop below starts at 1.
+    const yearIndexForItem = (item) => Math.max(0, num(item.year) - baseYear);
+    const plannedPoolHitAtYear = (source, y) =>
       plannedItems
-        .filter((i) => i.fundingSource === "cash" && num(i.amount) > 0 && num(i.year) === baseYear + y)
-        .reduce((s, i) => s + num(i.amount), 0);
-    const plannedCdHitAtYear = (y) =>
+        .filter((i) => num(i.amount) > 0 && yearIndexForItem(i) === y)
+        .reduce((s, i) => s + getFundingSplits(i).filter((sp) => sp.source === source).reduce((ss, sp) => ss + num(i.amount) * (num(sp.percent) / 100), 0), 0);
+    const plannedCashHitAtYear = (y) => plannedPoolHitAtYear("cash", y);
+    const plannedCdHitAtYear = (y) => plannedPoolHitAtYear("cd", y);
+    // RD splits without a chosen account reduce proportionally across all RDs (as before); splits
+    // that name a specific account reduce that one account directly.
+    const plannedRdProportionalHitAtYear = (y) =>
       plannedItems
-        .filter((i) => i.fundingSource === "cd" && num(i.amount) > 0 && num(i.year) === baseYear + y)
-        .reduce((s, i) => s + num(i.amount), 0);
+        .filter((i) => num(i.amount) > 0 && yearIndexForItem(i) === y)
+        .reduce((s, i) => s + getFundingSplits(i).filter((sp) => sp.source === "rd" && !sp.rdAccountId).reduce((ss, sp) => ss + num(i.amount) * (num(sp.percent) / 100), 0), 0);
+    const plannedRdSpecificHitsAtYear = (y) => {
+      const hits = {};
+      plannedItems
+        .filter((i) => num(i.amount) > 0 && yearIndexForItem(i) === y)
+        .forEach((i) => {
+          getFundingSplits(i)
+            .filter((sp) => sp.source === "rd" && sp.rdAccountId)
+            .forEach((sp) => {
+              const amt = num(i.amount) * (num(sp.percent) / 100);
+              hits[sp.rdAccountId] = (hits[sp.rdAccountId] || 0) + amt;
+            });
+        });
+      return hits;
+    };
+
+    // planned-item loan installments (only for splits with a tenure entered — amortizing loans),
+    // due every year the loan is within its term, deducted from cash the same as a real payment.
+    const plannedLoanInstallmentAtYear = (y) =>
+      plannedItems
+        .filter((i) => num(i.amount) > 0)
+        .reduce((s, i) => {
+          const startIdx = yearIndexForItem(i);
+          return (
+            s +
+            getFundingSplits(i)
+              .filter((sp) => sp.source === "loan" && num(sp.tenureYears) > 0)
+              .reduce((ss, sp) => {
+                const tenure = num(sp.tenureYears);
+                if (y < startIdx || y >= startIdx + tenure) return ss;
+                const principal = num(i.amount) * (num(sp.percent) / 100);
+                return ss + annualLoanInstallment(principal, num(sp.interestRate), tenure);
+              }, 0)
+          );
+        }, 0);
 
     let propState = properties.map((p) => ({
       key: `mortgage:${p.id}`,
@@ -1404,7 +1508,7 @@ export default function InvestmentPlanner() {
       for (const opp of summary.liquidationOpportunities) {
         if (opp.sourceType === "cash") liquidVal = Math.max(0, liquidVal - opp.amount);
         else if (opp.sourceType === "cd") cdsVal = Math.max(0, cdsVal - opp.amount);
-        else if (opp.sourceType === "rd") rdVal = Math.max(0, rdVal - opp.amount);
+        else if (opp.sourceType === "rd") reduceRdProportionally(opp.amount);
         applyToDebt(opp.debtKey, opp.amount);
       }
       for (const r of summary.restructureAnalysis) {
@@ -1415,22 +1519,35 @@ export default function InvestmentPlanner() {
       }
     }
 
+    // planned items scheduled for this year (or an already-past year, clamped forward) hit right
+    // away, before "Now" is even displayed — otherwise they'd be silently skipped, since the loop
+    // below only walks future years starting at 1. Loan installments (for tenured loan splits) are
+    // also already due starting the origination year.
+    liquidVal = Math.max(0, liquidVal - plannedCashHitAtYear(0));
+    cdsVal = Math.max(0, cdsVal - plannedCdHitAtYear(0));
+    reduceRdProportionally(plannedRdProportionalHitAtYear(0));
+    Object.entries(plannedRdSpecificHitsAtYear(0)).forEach(([accountId, amt]) => reduceRdAccountById(accountId, amt));
+    liquidVal = Math.max(0, liquidVal - plannedLoanInstallmentAtYear(0));
+
     const rows = [
       {
         year: 0, label: "Now",
-        liquid: liquidVal, cds: cdsVal, rd: rdVal, shares: sharesVal, k401: k401Val,
+        liquid: liquidVal, cds: cdsVal, rd: rdTotal(), rdByAccount: rdStates.map((r) => ({ id: r.id, label: r.label, value: r.value })), shares: sharesVal, k401: k401Val,
         propertyValue: propState.reduce((s, p) => s + p.value, 0),
         propertyLoans: propState.reduce((s, p) => s + p.loanBalance, 0),
         otherLoans: loanState.reduce((s, l) => s + l.balance, 0),
-        netWorth: liquidVal + cdsVal + rdVal + sharesVal + k401Val + propState.reduce((s, p) => s + (p.value - p.loanBalance), 0) - loanState.reduce((s, l) => s + l.balance, 0),
+        netWorth: liquidVal + cdsVal + rdTotal() + sharesVal + k401Val + propState.reduce((s, p) => s + (p.value - p.loanBalance), 0) - loanState.reduce((s, l) => s + l.balance, 0),
         emergencyTarget: summary.emergencyTarget,
       },
     ];
 
     for (let y = 1; y <= years; y++) {
-      // planned cash/CD spending for this year hits first
+      // planned cash/CD/RD spending for this year hits first, plus any loan installments now due
       liquidVal = Math.max(0, liquidVal - plannedCashHitAtYear(y));
       cdsVal = Math.max(0, cdsVal - plannedCdHitAtYear(y));
+      reduceRdProportionally(plannedRdProportionalHitAtYear(y));
+      Object.entries(plannedRdSpecificHitsAtYear(y)).forEach(([accountId, amt]) => reduceRdAccountById(accountId, amt));
+      liquidVal = Math.max(0, liquidVal - plannedLoanInstallmentAtYear(y));
 
       // this year's surplus: top up the (inflation-adjusted) emergency fund first if cash has fallen short —
       // e.g. after a big planned expense — then split whatever's left 70/30 the same way as the
@@ -1448,8 +1565,9 @@ export default function InvestmentPlanner() {
       const annualCdContribution_y = surplus_y * 0.3; // CDs/short-term savings
 
       cdsVal = cdsVal * (1 + cdRate) + annualCdContribution_y;
-      // yearly cumulative: this year's balance = prior balance (with accrued interest) + this year's contribution
-      rdVal = rdVal * (1 + rdRate) + rdContributionAtYear(y);
+      // yearly cumulative, per account: this year's balance = prior balance (with accrued interest)
+      // + this year's contribution, computed individually for every recurring deposit.
+      growRdStatesForYear(y);
       // 401(k)/PF: grows at its own rate, plus its annual contribution (also growing). Unlike the
       // Retirement Readiness simulation, this trajectory has no fixed "retirement year" to stop
       // contributions at, so they're modeled as continuing for the full projection — a simplification
@@ -1485,7 +1603,7 @@ export default function InvestmentPlanner() {
         const payoffsThisYear = summary.futurePayoffProjection.filter((p) => Math.ceil(p.month / 12) === y);
         for (const p of payoffsThisYear) {
           if (p.source === "CD funds") cdsVal = Math.max(0, cdsVal - p.amount);
-          else if (p.source === "recurring deposit funds") rdVal = Math.max(0, rdVal - p.amount);
+          else if (p.source === "recurring deposit funds") reduceRdProportionally(p.amount);
           else sharesVal = Math.max(0, sharesVal - p.amount);
           loanState = loanState.map((l) => (l.key === p.debtKey ? { ...l, balance: Math.max(0, l.balance - p.amount) } : l));
           propState = propState.map((pr) => (pr.key === p.debtKey ? { ...pr, loanBalance: Math.max(0, pr.loanBalance - p.amount) } : pr));
@@ -1495,8 +1613,13 @@ export default function InvestmentPlanner() {
       const propertyValue = propState.reduce((s, p) => s + p.value, 0);
       const propertyLoans = propState.reduce((s, p) => s + p.loanBalance, 0);
       const otherLoans = loanState.reduce((s, l) => s + l.balance, 0);
-      const netWorth = liquidVal + cdsVal + rdVal + sharesVal + k401Val + (propertyValue - propertyLoans) - otherLoans;
-      rows.push({ year: y, label: String(baseYear + y), liquid: liquidVal, cds: cdsVal, rd: rdVal, shares: sharesVal, k401: k401Val, propertyValue, propertyLoans, otherLoans, netWorth, emergencyTarget: target_y });
+      const rdTotalThisYear = rdTotal();
+      const netWorth = liquidVal + cdsVal + rdTotalThisYear + sharesVal + k401Val + (propertyValue - propertyLoans) - otherLoans;
+      rows.push({
+        year: y, label: String(baseYear + y), liquid: liquidVal, cds: cdsVal, rd: rdTotalThisYear,
+        rdByAccount: rdStates.map((r) => ({ id: r.id, label: r.label, value: r.value })),
+        shares: sharesVal, k401: k401Val, propertyValue, propertyLoans, otherLoans, netWorth, emergencyTarget: target_y,
+      });
     }
 
     const maxAbs = Math.max(...rows.map((r) => Math.abs(r.netWorth)), 1);
@@ -1506,6 +1629,8 @@ export default function InvestmentPlanner() {
   };
 
   const [netWorthTablePayoffsApplied, setNetWorthTablePayoffsApplied] = useState(false);
+  const [expandedNwCategories, setExpandedNwCategories] = useState({ cds: true, rd: true, plannedAssets: true, plannedLiabilities: true });
+  const toggleNwCategory = (key) => setExpandedNwCategories((c) => ({ ...c, [key]: !c[key] }));
   const netWorthTableTrajectory = useMemo(
     () => buildNetWorthTrajectory(netWorthTablePayoffsApplied),
     [
@@ -1711,6 +1836,20 @@ export default function InvestmentPlanner() {
           font-family: 'IBM Plex Mono', monospace; margin-top: 2px; flex-wrap: wrap; align-items: center;
         }
         .holding-readout strong { color: var(--emerald); }
+
+        .funding-splits { grid-column: 1 / -1; margin-top: 6px; }
+        .funding-splits-header { font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+        .split-total-ok { color: var(--emerald); }
+        .split-total-warn { color: var(--rust); }
+        .funding-split-row {
+          display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap;
+        }
+        .funding-split-row .type-select { min-width: 170px; }
+        .funding-split-percent { display: flex; align-items: center; gap: 4px; }
+        .funding-split-percent input { width: 56px; }
+        .funding-split-tenure { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+        .funding-split-tenure input { width: 64px; }
+        .split-amount { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--gold); margin-left: auto; }
         .fetch-note { font-family: 'Public Sans', sans-serif; }
         .fetch-note.ok { color: var(--emerald); }
         .fetch-note.err { color: var(--rust); }
@@ -1825,6 +1964,14 @@ export default function InvestmentPlanner() {
         }
         .balance-sheet-table th { background: var(--bg); color: var(--text); font-weight: 600; position: sticky; top: 0; }
         .bs-now-date { font-family: 'Public Sans', sans-serif; font-weight: 400; font-size: 10px; color: var(--gold); margin-top: 2px; text-transform: none; }
+        .bs-group-row td { font-weight: 600; }
+        .bs-expand-toggle {
+          background: none; border: none; color: inherit; font: inherit; font-weight: 600; cursor: pointer;
+          padding: 0; text-align: left;
+        }
+        .bs-expand-toggle:hover { color: var(--gold); }
+        .bs-child-row td { color: var(--muted); font-weight: 400; }
+        .bs-child-label { padding-left: 26px !important; }
         .balance-sheet-table .bs-row-label {
           text-align: left; font-family: 'Public Sans', sans-serif; color: var(--muted); white-space: nowrap;
           position: sticky; left: 0; background: var(--panel); z-index: 1;
@@ -2433,6 +2580,14 @@ export default function InvestmentPlanner() {
               </p>
               {plannedItems.map((item) => {
                 const isCollapsed = collapsedPlannedIds.includes(item.id);
+                const splits = getFundingSplits(item);
+                const splitLabel = (s) => {
+                  if (s.source === "rd" && s.rdAccountId) {
+                    const acct = recurringDeposits.find((rd) => rd.id === s.rdAccountId);
+                    return `${acct?.label || "a specific recurring deposit"}`;
+                  }
+                  return { none: "external/untracked funds", cash: "cash", cd: "CD funds", rd: "recurring deposit funds (any)", loan: "a new loan" }[s.source] || s.source;
+                };
                 if (isCollapsed) {
                   return (
                     <div className="plan-item planned-item-summary" key={item.id}>
@@ -2443,7 +2598,13 @@ export default function InvestmentPlanner() {
                         </span>
                       </div>
                       <div className="note">
-                        {item.category} · {item.type === "asset" ? "Asset" : "Liability"} · funded by {{ none: "external/untracked funds", cash: "cash (savings/checking)", cd: "CD funds", loan: "a new loan" }[item.fundingSource || "none"]}
+                        {item.category} · {item.type === "asset" ? "Asset" : "Expense"} · funded by{" "}
+                        {splits.map((s, i) => (
+                          <span key={s.id}>
+                            {i > 0 ? ", " : ""}
+                            {s.percent}% {splitLabel(s)}{s.source === "loan" && num(s.interestRate) > 0 ? ` at ${pct(num(s.interestRate))}/yr` : ""}
+                          </span>
+                        ))}
                       </div>
                       <div className="planned-item-actions">
                         <button type="button" className="explain-toggle" onClick={() => togglePlannedCollapse(item.id)}>Edit ▾</button>
@@ -2452,6 +2613,7 @@ export default function InvestmentPlanner() {
                     </div>
                   );
                 }
+                const splitTotal = splits.reduce((s, sp) => s + num(sp.percent), 0);
                 return (
                   <RowShell key={item.id} onRemove={() => removePlannedItem(item.id)} gridClassName="shares-grid">
                     <Field label="Category">
@@ -2475,11 +2637,32 @@ export default function InvestmentPlanner() {
                       <input className="text-input" value={item.label} onChange={(e) => updatePlannedItem(item.id, "label", e.target.value)} placeholder="e.g. Daughter's college tuition" />
                     </Field>
                     <Field label="Type">
-                      <select className="type-select" value={item.type} onChange={(e) => updatePlannedItem(item.id, "type", e.target.value)}>
-                        <option value="liability">Liability (expense)</option>
+                      <select className="type-select" value={item.type === "asset" ? "asset" : "expense"} onChange={(e) => updatePlannedItem(item.id, "type", e.target.value)}>
+                        <option value="expense">Expense</option>
                         <option value="asset">Asset</option>
                       </select>
                     </Field>
+                    {item.type === "asset" && (
+                      <div className="funding-split-row full-width">
+                        <Field label="Annual value diminish" suffix="how the asset loses value each year">
+                          <select className="type-select" value={item.depreciationMode || "none"} onChange={(e) => updatePlannedItem(item.id, "depreciationMode", e.target.value)}>
+                            <option value="none">No diminishment</option>
+                            <option value="percent">Percent per year</option>
+                            <option value="amount">Dollar amount per year</option>
+                          </select>
+                        </Field>
+                        {item.depreciationMode === "percent" && (
+                          <Field label="Diminish rate" suffix="% per year">
+                            <RateInput value={item.depreciationValue} onChange={(v) => updatePlannedItem(item.id, "depreciationValue", v)} />
+                          </Field>
+                        )}
+                        {item.depreciationMode === "amount" && (
+                          <Field label="Diminish amount" suffix="$ per year">
+                            <MoneyInput value={item.depreciationValue} onChange={(v) => updatePlannedItem(item.id, "depreciationValue", v)} />
+                          </Field>
+                        )}
+                      </div>
+                    )}
                     <Field label="Amount">
                       <MoneyInput value={item.amount} onChange={(v) => updatePlannedItem(item.id, "amount", v)} />
                     </Field>
@@ -2493,20 +2676,77 @@ export default function InvestmentPlanner() {
                         onChange={(e) => updatePlannedItem(item.id, "year", e.target.value)}
                       />
                     </Field>
-                    <Field label="Funded by" suffix="what pays for it">
-                      <select className="type-select" value={item.fundingSource || "none"} onChange={(e) => updatePlannedItem(item.id, "fundingSource", e.target.value)}>
-                        <option value="none">External / untracked funds</option>
-                        <option value="cash">Cash (savings/checking)</option>
-                        <option value="cd">CD funds</option>
-                        <option value="loan">New loan</option>
-                      </select>
-                    </Field>
+                    <div className="funding-splits full-width">
+                      <div className="funding-splits-header">
+                        Funded by <span className={splitTotal === 100 ? "split-total-ok" : "split-total-warn"}>({splitTotal}% allocated{splitTotal !== 100 ? " — should total 100%" : ""})</span>
+                      </div>
+                      {splits.map((split) => (
+                        <div className="funding-split-row" key={split.id}>
+                          <select className="type-select" value={split.source} onChange={(e) => updateFundingSplit(item.id, split.id, "source", e.target.value)}>
+                            <option value="none">External / untracked funds</option>
+                            <option value="cash">Cash (savings/checking)</option>
+                            <option value="cd">CD funds</option>
+                            <option value="rd">Recurring Deposit funds</option>
+                            <option value="loan">New loan</option>
+                          </select>
+                          <div className="funding-split-percent">
+                            <input
+                              className="text-input"
+                              type="number"
+                              min="0"
+                              max="100"
+                              value={split.percent}
+                              onChange={(e) => updateFundingSplit(item.id, split.id, "percent", e.target.value)}
+                            />
+                            <span>%</span>
+                          </div>
+                          {split.source === "rd" && recurringDeposits.length > 0 && (
+                            <select
+                              className="type-select"
+                              value={split.rdAccountId || ""}
+                              onChange={(e) => updateFundingSplit(item.id, split.id, "rdAccountId", e.target.value)}
+                            >
+                              <option value="">Any RD (proportional)</option>
+                              {recurringDeposits.map((rd) => (
+                                <option key={rd.id} value={rd.id}>{rd.label || "Recurring Deposit"}</option>
+                              ))}
+                            </select>
+                          )}
+                          {split.source === "loan" && (
+                            <>
+                              <RateInput value={split.interestRate} onChange={(v) => updateFundingSplit(item.id, split.id, "interestRate", v)} />
+                              <div className="funding-split-tenure">
+                                <input
+                                  className="text-input"
+                                  type="number"
+                                  min="0"
+                                  value={split.tenureYears || ""}
+                                  placeholder="tenure yrs"
+                                  onChange={(e) => updateFundingSplit(item.id, split.id, "tenureYears", e.target.value)}
+                                />
+                                <span>yr term</span>
+                              </div>
+                            </>
+                          )}
+                          <span className="split-amount">{money(num(item.amount) * (num(split.percent) / 100))}</span>
+                          {splits.length > 1 && (
+                            <button type="button" className="remove-btn" onClick={() => removeFundingSplit(item.id, split.id)} aria-label="Remove this funding source">✕</button>
+                          )}
+                        </div>
+                      ))}
+                      <button type="button" className="explain-toggle" onClick={() => addFundingSplit(item.id)} style={{ marginTop: 4 }}>+ Add another funding source</button>
+                    </div>
                     <div className="holding-readout">
                       <span>
-                        {item.fundingSource === "cash" && "Reduces your Savings & Checking row starting that year."}
-                        {item.fundingSource === "cd" && "Reduces your CDs row starting that year."}
-                        {item.fundingSource === "loan" && "Adds a new loan liability row starting that year."}
-                        {(!item.fundingSource || item.fundingSource === "none") && "Applied directly to net worth without touching any tracked cash/CD balance."}
+                        {splits.some((s) => s.source === "cash") && "Cash portion reduces Savings & Checking. "}
+                        {splits.some((s) => s.source === "cd") && "CD portion reduces CDs. "}
+                        {splits.some((s) => s.source === "rd" && !s.rdAccountId) && "Recurring deposit portion reduces proportionally across all RDs. "}
+                        {splits.some((s) => s.source === "rd" && s.rdAccountId) && "Recurring deposit portion reduces the specific account chosen. "}
+                        {splits.some((s) => s.source === "loan") && splits.some((s) => s.source === "loan" && num(s.tenureYears) > 0)
+                          ? "Loan portion adds a liability row that amortizes down to zero over its term, with the annual installment deducted from Savings & Checking each year of the term. "
+                          : splits.some((s) => s.source === "loan") && "Loan portion adds a liability row that compounds at its own rate with no term entered — set a tenure above to amortize it with real payments instead. "}
+                        {splits.some((s) => s.source === "none") && "External/untracked portion is applied directly without touching any tracked balance. "}
+                        All effective starting the year above. Each starts at their own percentage of the total amount.
                       </span>
                       <button type="button" className="explain-toggle" onClick={() => togglePlannedCollapse(item.id)} style={{ marginTop: 0 }}>Collapse ▴</button>
                     </div>
@@ -2525,29 +2765,133 @@ export default function InvestmentPlanner() {
                 const baseYear = currentYear();
                 const activeAt = (item, r) => (baseYear + r.year >= num(item.year) ? num(item.amount) : 0);
                 const plannedRowGetter = (item) => (r) => activeAt(item, r);
+                // Asset items can lose value each year they're held — either a flat percent or a fixed
+                // dollar amount — rather than sitting at their purchase price forever.
+                const assetRowGetter = (item) => (r) => {
+                  const itemYear = num(item.year);
+                  const calYear = baseYear + r.year;
+                  if (calYear < itemYear) return 0;
+                  const yearsElapsed = calYear - itemYear;
+                  const amt = num(item.amount);
+                  if (item.depreciationMode === "percent" && num(item.depreciationValue) > 0) {
+                    return amt * Math.pow(1 - num(item.depreciationValue) / 100, yearsElapsed);
+                  }
+                  if (item.depreciationMode === "amount" && num(item.depreciationValue) > 0) {
+                    return Math.max(0, amt - num(item.depreciationValue) * yearsElapsed);
+                  }
+                  return amt;
+                };
 
                 const validItems = plannedItems.filter((i) => num(i.amount) > 0 && num(i.year) > 0);
                 const assetItems = validItems.filter((i) => i.type === "asset");
-                const loanFundedItems = validItems.filter((i) => i.fundingSource === "loan");
-                const untrackedLiabilityItems = validItems.filter((i) => i.type === "liability" && (!i.fundingSource || i.fundingSource === "none"));
+                const liabilityItems = validItems.filter((i) => i.type !== "asset");
+
+                // Cash/CD/RD splits are invisible here — they just reduce those pools (handled by the
+                // trajectory engine). Loan splits and liability-type "external/untracked" splits each
+                // need their own row, scaled to that split's percentage of the item's total amount.
+                const buildSplitRows = (item) =>
+                  getFundingSplits(item)
+                    .map((sp) => {
+                      const splitAmt = num(item.amount) * (num(sp.percent) / 100);
+                      if (splitAmt <= 0) return null;
+                      const pctSuffix = num(sp.percent) < 100 ? ` (${sp.percent}%)` : "";
+                      if (sp.source === "loan") {
+                        const tenure = num(sp.tenureYears);
+                        const rate = num(sp.interestRate) || 0;
+                        return {
+                          label: `${item.label || item.category} loan${pctSuffix} (${item.year}${rate > 0 ? ` @ ${pct(rate)}` : ""}${tenure > 0 ? `, ${tenure}yr term` : ""})`,
+                          get: (r) => {
+                            const itemYear = num(item.year);
+                            const calYear = baseYear + r.year;
+                            if (calYear < itemYear) return 0;
+                            const yearsElapsed = calYear - itemYear;
+                            if (tenure > 0) return annualLoanBalanceAfter(splitAmt, rate, tenure, yearsElapsed);
+                            // no term entered — interest-only compounding, since there's no payment to amortize against
+                            return splitAmt * Math.pow(1 + rate / 100, yearsElapsed);
+                          },
+                        };
+                      }
+                      if (sp.source === "none" && item.type !== "asset") {
+                        return {
+                          label: `${item.label || item.category}${pctSuffix} (${item.year})`,
+                          get: (r) => activeAt({ ...item, amount: splitAmt }, r),
+                        };
+                      }
+                      return null;
+                    })
+                    .filter(Boolean);
+
+                // CDs are still tracked as one pooled balance going forward (growth + contributions),
+                // not each account's own trajectory, so a per-CD breakdown is only meaningful for
+                // today's snapshot. Recurring deposits, however, are tracked individually by the engine
+                // (see rdByAccount on each row), so their breakdown is accurate across every column.
+                const cdChildren = cds
+                  .filter((c) => num(c.amount) > 0)
+                  .map((c) => ({ label: c.label || "CD", get: (r) => (r.year === 0 ? num(c.amount) : null) }));
+                const rdChildren = recurringDeposits
+                  .filter((rd) => summary.rdComputed.find((x) => x.id === rd.id))
+                  .map((rd) => ({
+                    label: rd.label || "Recurring Deposit",
+                    get: (r) => r.rdByAccount?.find((x) => x.id === rd.id)?.value ?? 0,
+                  }));
+
+                const plannedAssetChildren = assetItems.map((item) => ({
+                  label: `${item.label || item.category} (${item.year}${item.depreciationMode === "percent" && num(item.depreciationValue) > 0 ? `, −${pct(num(item.depreciationValue))}/yr` : item.depreciationMode === "amount" && num(item.depreciationValue) > 0 ? `, −${money(num(item.depreciationValue))}/yr` : ""})`,
+                  get: assetRowGetter(item),
+                }));
+                // Loan splits always belong on the liabilities side — including ones that fund an
+                // asset purchase, since the loan itself is a liability regardless of what it bought.
+                const plannedLiabilityChildren = [...liabilityItems, ...assetItems].flatMap(buildSplitRows);
 
                 const assetRows = [
-                  { label: "Savings & Checking", get: (r) => r.liquid },
-                  { label: "CDs", get: (r) => r.cds },
-                  { label: "Recurring Deposits", get: (r) => r.rd },
-                  { label: "Shares", get: (r) => r.shares },
-                  { label: country === "India" ? "Provident Fund" : "401(k)", get: (r) => r.k401 },
-                  { label: "Property Value", get: (r) => r.propertyValue },
-                  ...assetItems.map((item) => ({ label: `${item.label || item.category} (${item.year})`, get: plannedRowGetter(item) })),
+                  { type: "leaf", label: "Savings & Checking", get: (r) => r.liquid },
+                  { type: "group", key: "cds", label: "CDs", get: (r) => r.cds, children: cdChildren },
+                  { type: "group", key: "rd", label: "Recurring Deposits", get: (r) => r.rd, children: rdChildren },
+                  { type: "leaf", label: "Shares", get: (r) => r.shares },
+                  { type: "leaf", label: country === "India" ? "Provident Fund" : "401(k)", get: (r) => r.k401 },
+                  { type: "leaf", label: "Property Value", get: (r) => r.propertyValue },
+                  ...(plannedAssetChildren.length > 0
+                    ? [{ type: "group", key: "plannedAssets", label: "Planned Big Items", get: (r) => plannedAssetChildren.reduce((s, c) => s + (c.get(r) || 0), 0), children: plannedAssetChildren }]
+                    : []),
                 ];
                 const liabilityRows = [
-                  { label: "Property Loans", get: (r) => r.propertyLoans },
-                  { label: "Other Loans", get: (r) => r.otherLoans },
-                  ...untrackedLiabilityItems.map((item) => ({ label: `${item.label || item.category} (${item.year})`, get: plannedRowGetter(item) })),
-                  ...loanFundedItems.map((item) => ({ label: `${item.label || item.category} loan (${item.year})`, get: plannedRowGetter(item) })),
+                  { type: "leaf", label: "Property Loans", get: (r) => r.propertyLoans },
+                  { type: "leaf", label: "Other Loans", get: (r) => r.otherLoans },
+                  ...(plannedLiabilityChildren.length > 0
+                    ? [{ type: "group", key: "plannedLiabilities", label: "Planned Big Items", get: (r) => plannedLiabilityChildren.reduce((s, c) => s + (c.get(r) || 0), 0), children: plannedLiabilityChildren }]
+                    : []),
                 ];
                 const totalAssets = (r) => assetRows.reduce((s, row) => s + row.get(r), 0);
                 const totalLiabilities = (r) => liabilityRows.reduce((s, row) => s + row.get(r), 0);
+                const renderCell = (val) => (val === null || val === undefined ? "—" : money(val));
+                const renderRowGroup = (row) => (
+                  <React.Fragment key={row.label + (row.key || "")}>
+                    <tr className={row.type === "group" ? "bs-group-row" : ""}>
+                      <td className="bs-row-label">
+                        {row.type === "group" ? (
+                          <button type="button" className="bs-expand-toggle" onClick={() => toggleNwCategory(row.key)}>
+                            {expandedNwCategories[row.key] ? "▾" : "▸"} {row.label}
+                          </button>
+                        ) : (
+                          row.label
+                        )}
+                      </td>
+                      {shown.map((r) => (
+                        <td key={r.year}>{money(row.get(r))}</td>
+                      ))}
+                    </tr>
+                    {row.type === "group" &&
+                      expandedNwCategories[row.key] &&
+                      row.children.map((child) => (
+                        <tr className="bs-child-row" key={row.key + child.label}>
+                          <td className="bs-row-label bs-child-label">{child.label}</td>
+                          {shown.map((r) => (
+                            <td key={r.year}>{renderCell(child.get(r))}</td>
+                          ))}
+                        </tr>
+                      ))}
+                  </React.Fragment>
+                );
                 return (
                   <div className="balance-sheet-wrap">
                     <table className="balance-sheet-table">
@@ -2566,14 +2910,7 @@ export default function InvestmentPlanner() {
                         <tr className="bs-section-row">
                           <td className="bs-row-label" colSpan={shown.length + 1}>Assets</td>
                         </tr>
-                        {assetRows.map((row) => (
-                          <tr key={row.label}>
-                            <td className="bs-row-label">{row.label}</td>
-                            {shown.map((r) => (
-                              <td key={r.year}>{money(row.get(r))}</td>
-                            ))}
-                          </tr>
-                        ))}
+                        {assetRows.map(renderRowGroup)}
                         <tr className="bs-subtotal-row">
                           <td className="bs-row-label">Total Assets</td>
                           {shown.map((r) => (
@@ -2583,14 +2920,7 @@ export default function InvestmentPlanner() {
                         <tr className="bs-section-row">
                           <td className="bs-row-label" colSpan={shown.length + 1}>Liabilities</td>
                         </tr>
-                        {liabilityRows.map((row) => (
-                          <tr key={row.label}>
-                            <td className="bs-row-label">{row.label}</td>
-                            {shown.map((r) => (
-                              <td key={r.year}>{money(row.get(r))}</td>
-                            ))}
-                          </tr>
-                        ))}
+                        {liabilityRows.map(renderRowGroup)}
                         <tr className="bs-subtotal-row">
                           <td className="bs-row-label">Total Liabilities</td>
                           {shown.map((r) => (
@@ -2609,7 +2939,7 @@ export default function InvestmentPlanner() {
                 );
               })()}
               <p className="section-hint" style={{ marginTop: 10 }}>
-                Columns are thinned to a readable number when projecting many years — the last column is always the final projected year. {netWorthTablePayoffsApplied ? "The \"Now\" column and every column after reflect today's already-qualifying one-time actions (cash, CD, recurring deposit, and share payoffs), plus every future payoff proposal applied in the year it would trigger." : "This is the baseline path — no one-time or future payoff proposals have been applied yet. Use the button above to see the effect of acting on them."} Planned big items appear once their year arrives and stay reflected after: assets get their own row; cash- or CD-funded items reduce the Savings & Checking or CDs row directly (and count as a genuine draw-down, not just a display subtraction — see below); loan-funded items add a new loan row. Your emergency fund target holds steady in year 1, then grows {pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on. If a cash- or CD-funded item pulls Savings & Checking below that target, up to half of each subsequent year's cash flow surplus is redirected to refill it first — the same 50% cap the Suggested Monthly Allocation plan uses — before anything goes toward CDs or shares.
+                Columns are thinned to a readable number when projecting many years — the last column is always the final projected year. Click CDs, Recurring Deposits, or Planned Big Items to expand or collapse the individual accounts/items behind that total. Individual CD balances are only shown for the "Now" column (a dash elsewhere) since CDs are tracked as one combined pool going forward; recurring deposits, by contrast, are tracked account-by-account at their own rate and contribution schedule, so their breakdown is accurate in every column and the category total is an exact sum of those accounts, not a separate approximation. {netWorthTablePayoffsApplied ? "The \"Now\" column and every column after reflect today's already-qualifying one-time actions (cash, CD, recurring deposit, and share payoffs), plus every future payoff proposal applied in the year it would trigger." : "This is the baseline path — no one-time or future payoff proposals have been applied yet. Use the button above to see the effect of acting on them."} Planned big items can be split across multiple funding sources by percentage (e.g. 20% cash, 80% new loan) — each split hits its own pool for its share of the amount, starting the year the item occurs (or immediately, if that year has already passed). Cash, CD, and recurring-deposit portions reduce that balance directly — a genuine draw-down inside the simulation, not just a display subtraction. Loan portions with a tenure entered amortize down to zero over that term, with the annual installment deducted from Savings & Checking each year of the term; without a tenure, the balance simply compounds with no payments modeled. Your emergency fund target holds steady in year 1, then grows {pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on. If a cash-, CD-, or RD-funded portion pulls a balance below that target, up to half of each subsequent year's cash flow surplus is redirected to refill it first — the same 50% cap the Suggested Monthly Allocation plan uses — before anything goes toward CDs or shares.
               </p>
             </div>
           )}
@@ -3142,7 +3472,7 @@ export default function InvestmentPlanner() {
                   {netWorthTablePayoffsApplied ? "↺ Reset to baseline (no payoffs applied)" : "↻ Recalculate with recommended payoffs"}
                 </button>
                 <p className="alloc-note" style={{ marginTop: 8 }}>
-                  Up to half of each year's cash flow surplus tops up your emergency fund first if a big planned expense (or anything else) has pulled cash below target — same 50% cap as the Suggested Monthly Allocation plan. That target holds steady in year 1, then grows {pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on, rather than staying a fixed dollar figure forever. The rest of the surplus (all of it, once the fund is full) splits 70/30 between retirement investing (shares) and CDs/short-term savings. CDs grow at your {pct(num(marketCdRate))}/yr market rate (new money earns today's rate, regardless of what any existing CDs happen to carry), shares at {pct(summary.totalExpectedReturn)}/yr plus that contribution, and property at {pct(netWorthTableTrajectory.apprRate)}/yr appreciation, while amortizing mortgages and loans that have a rate on file. Recurring deposits compound at {pct(summary.weightedRDRate)}/yr and keep receiving each plan's own annual contribution (monthly deposit × 12) until that plan's own maturity date, then stop — each year's balance is the prior year's balance plus accrued interest plus that year's contribution. Your {country === "India" ? "Provident Fund" : "401(k)"} grows at {pct(summary.k401GrowthPct)}/yr plus its own annual contribution (growing at {pct(summary.k401ContributionGrowthPct)}/yr) — unlike the Retirement Readiness simulation, this trajectory has no fixed retirement year, so that contribution is assumed to continue for the full projection. {netWorthTablePayoffsApplied ? "Today's already-qualifying one-time actions (cash, CD, recurring deposit, and share payoffs) are applied right at the start, and future payoff proposals are applied in the year they'd trigger — each reducing both that debt and the asset used." : "This is the baseline path — no one-time or future payoff proposals are applied yet; toggle the button above to see their effect."} This toggle is shared with the Net Worth tab's table. A simplification — real contributions, rates, and returns will vary year to year.
+                  Up to half of each year's cash flow surplus tops up your emergency fund first if a big planned expense (or anything else) has pulled cash below target — same 50% cap as the Suggested Monthly Allocation plan. That target holds steady in year 1, then grows {pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on, rather than staying a fixed dollar figure forever. The rest of the surplus (all of it, once the fund is full) splits 70/30 between retirement investing (shares) and CDs/short-term savings. CDs grow at your {pct(num(marketCdRate))}/yr market rate (new money earns today's rate, regardless of what any existing CDs happen to carry), shares at {pct(summary.totalExpectedReturn)}/yr plus that contribution, and property at {pct(netWorthTableTrajectory.apprRate)}/yr appreciation, while amortizing mortgages and loans that have a rate on file. Each recurring deposit compounds individually at its own rate and keeps receiving its own annual contribution (monthly deposit × 12) until its own maturity date, then stops — the Recurring Deposits total is an exact sum of every account's own trajectory, not a single blended rate applied to a combined pool. Your {country === "India" ? "Provident Fund" : "401(k)"} grows at {pct(summary.k401GrowthPct)}/yr plus its own annual contribution (growing at {pct(summary.k401ContributionGrowthPct)}/yr) — unlike the Retirement Readiness simulation, this trajectory has no fixed retirement year, so that contribution is assumed to continue for the full projection. {netWorthTablePayoffsApplied ? "Today's already-qualifying one-time actions (cash, CD, recurring deposit, and share payoffs) are applied right at the start, and future payoff proposals are applied in the year they'd trigger — each reducing both that debt and the asset used." : "This is the baseline path — no one-time or future payoff proposals are applied yet; toggle the button above to see their effect."} This toggle is shared with the Net Worth tab's table. A simplification — real contributions, rates, and returns will vary year to year.
                 </p>
                 <div className="projection-rows nwt-rows">
                   {netWorthTableTrajectory.rows
