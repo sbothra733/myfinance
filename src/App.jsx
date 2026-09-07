@@ -1440,6 +1440,7 @@ export default function InvestmentPlanner() {
         .reduce((s, i) => s + getFundingSplits(i).filter((sp) => sp.source === source).reduce((ss, sp) => ss + num(i.amount) * (num(sp.percent) / 100), 0), 0);
     const plannedCashHitAtYear = (y) => plannedPoolHitAtYear("cash", y);
     const plannedCdHitAtYear = (y) => plannedPoolHitAtYear("cd", y);
+    const plannedSharesHitAtYear = (y) => plannedPoolHitAtYear("shares", y);
     // RD splits without a chosen account reduce proportionally across all RDs (as before); splits
     // that name a specific account reduce that one account directly.
     const plannedRdProportionalHitAtYear = (y) =>
@@ -1527,6 +1528,7 @@ export default function InvestmentPlanner() {
     cdsVal = Math.max(0, cdsVal - plannedCdHitAtYear(0));
     reduceRdProportionally(plannedRdProportionalHitAtYear(0));
     Object.entries(plannedRdSpecificHitsAtYear(0)).forEach(([accountId, amt]) => reduceRdAccountById(accountId, amt));
+    sharesVal = Math.max(0, sharesVal - plannedSharesHitAtYear(0));
     liquidVal = Math.max(0, liquidVal - plannedLoanInstallmentAtYear(0));
 
     const rows = [
@@ -1542,11 +1544,12 @@ export default function InvestmentPlanner() {
     ];
 
     for (let y = 1; y <= years; y++) {
-      // planned cash/CD/RD spending for this year hits first, plus any loan installments now due
+      // planned cash/CD/RD/shares spending for this year hits first, plus any loan installments now due
       liquidVal = Math.max(0, liquidVal - plannedCashHitAtYear(y));
       cdsVal = Math.max(0, cdsVal - plannedCdHitAtYear(y));
       reduceRdProportionally(plannedRdProportionalHitAtYear(y));
       Object.entries(plannedRdSpecificHitsAtYear(y)).forEach(([accountId, amt]) => reduceRdAccountById(accountId, amt));
+      sharesVal = Math.max(0, sharesVal - plannedSharesHitAtYear(y));
       liquidVal = Math.max(0, liquidVal - plannedLoanInstallmentAtYear(y));
 
       // this year's surplus: top up the (inflation-adjusted) emergency fund first if cash has fallen short —
@@ -1655,6 +1658,27 @@ export default function InvestmentPlanner() {
     { label: "Property equity", value: summary.totalPropertyEquity, positive: summary.totalPropertyEquity >= 0 },
     { label: "Loan balances", value: -summary.totalLoanBalance, positive: false },
   ];
+
+  // Estimates what's actually projected to be available in a given funding source by an item's
+  // year, so an over-committed split can be flagged rather than silently capped at zero. Uses the
+  // balance at the end of the prior year (or today's actual balance for a same-year item) as a
+  // reasonable "going into this withdrawal" baseline — an approximation, since two items drawing
+  // from the same pool in the same year aren't cross-checked against each other.
+  const estimateAvailable = (item, split) => {
+    const yearIndex = Math.max(0, num(item.year) - currentYear());
+    const priorRow = yearIndex === 0 ? null : netWorthTableTrajectory.rows[yearIndex - 1];
+    if (split.source === "cash") return priorRow ? priorRow.liquid : summary.liquid;
+    if (split.source === "cd") return priorRow ? priorRow.cds : summary.totalCds;
+    if (split.source === "shares") return priorRow ? priorRow.shares : summary.totalShares;
+    if (split.source === "rd") {
+      if (split.rdAccountId) {
+        if (priorRow) return priorRow.rdByAccount?.find((x) => x.id === split.rdAccountId)?.value ?? 0;
+        return summary.rdComputed.find((x) => x.id === split.rdAccountId)?.currentValue ?? 0;
+      }
+      return priorRow ? priorRow.rd : summary.totalRDCurrentValue;
+    }
+    return null; // loan/none sources aren't balance-limited
+  };
 
   return (
     <CurrencyContext.Provider value={{ code: currency, symbol: currencySymbol }}>
@@ -1781,6 +1805,12 @@ export default function InvestmentPlanner() {
         .tab-btn:hover:not(.active) { border-color: var(--gold); color: var(--text); }
 
         h2.section-title { font-size: 15px; margin: 0 0 4px; color: var(--text); }
+        .expenses-total-row {
+          display: flex; justify-content: space-between; align-items: center;
+          margin-top: 16px; padding: 10px 14px; border: 1px solid var(--gold); border-radius: 8px;
+          background: var(--panel-2); font-size: 13px;
+        }
+        .expenses-total-value { font-family: 'IBM Plex Mono', monospace; font-weight: 700; color: var(--gold); font-size: 15px; }
         p.section-hint { color: var(--muted); font-size: 12.5px; margin: 0 0 18px; }
 
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -1850,6 +1880,12 @@ export default function InvestmentPlanner() {
         .funding-split-tenure { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
         .funding-split-tenure input { width: 64px; }
         .split-amount { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--gold); margin-left: auto; }
+        .funding-split-row-wrap { margin-bottom: 6px; }
+        .funding-split-row-wrap .funding-split-row { margin-bottom: 4px; }
+        .split-insufficient-warning {
+          font-size: 11px; color: var(--rust); background: rgba(196, 90, 74, 0.1);
+          border: 1px solid var(--rust); border-radius: 6px; padding: 6px 10px; margin: 2px 0 6px;
+        }
         .fetch-note { font-family: 'Public Sans', sans-serif; }
         .fetch-note.ok { color: var(--emerald); }
         .fetch-note.err { color: var(--rust); }
@@ -2586,6 +2622,10 @@ export default function InvestmentPlanner() {
                     const acct = recurringDeposits.find((rd) => rd.id === s.rdAccountId);
                     return `${acct?.label || "a specific recurring deposit"}`;
                   }
+                  if (s.source === "shares") {
+                    const holding = shares.find((h) => h.id === s.shareHoldingId);
+                    return `sale of ${holding?.ticker || "shares"}`;
+                  }
                   return { none: "external/untracked funds", cash: "cash", cd: "CD funds", rd: "recurring deposit funds (any)", loan: "a new loan" }[s.source] || s.source;
                 };
                 if (isCollapsed) {
@@ -2680,13 +2720,19 @@ export default function InvestmentPlanner() {
                       <div className="funding-splits-header">
                         Funded by <span className={splitTotal === 100 ? "split-total-ok" : "split-total-warn"}>({splitTotal}% allocated{splitTotal !== 100 ? " — should total 100%" : ""})</span>
                       </div>
-                      {splits.map((split) => (
-                        <div className="funding-split-row" key={split.id}>
+                      {splits.map((split) => {
+                        const splitAmt = num(item.amount) * (num(split.percent) / 100);
+                        const available = estimateAvailable(item, split);
+                        const insufficient = available !== null && splitAmt > available + 0.01;
+                        return (
+                        <div className="funding-split-row-wrap" key={split.id}>
+                        <div className="funding-split-row">
                           <select className="type-select" value={split.source} onChange={(e) => updateFundingSplit(item.id, split.id, "source", e.target.value)}>
                             <option value="none">External / untracked funds</option>
                             <option value="cash">Cash (savings/checking)</option>
                             <option value="cd">CD funds</option>
                             <option value="rd">Recurring Deposit funds</option>
+                            <option value="shares">Sale of shares</option>
                             <option value="loan">New loan</option>
                           </select>
                           <div className="funding-split-percent">
@@ -2712,6 +2758,39 @@ export default function InvestmentPlanner() {
                               ))}
                             </select>
                           )}
+                          {split.source === "shares" && shares.length > 0 && (() => {
+                            const holding = shares.find((h) => h.id === split.shareHoldingId) || shares[0];
+                            const yearsOut = Math.max(0, num(item.year) - currentYear());
+                            const extrapolatedPrice = num(holding.price) * Math.pow(1 + num(sharesReturn) / 100, yearsOut);
+                            const effectivePrice = split.overridePrice !== undefined && split.overridePrice !== "" ? num(split.overridePrice) : extrapolatedPrice;
+                            const splitAmt = num(item.amount) * (num(split.percent) / 100);
+                            const qty = effectivePrice > 0 ? splitAmt / effectivePrice : 0;
+                            return (
+                              <>
+                                <select
+                                  className="type-select"
+                                  value={split.shareHoldingId || shares[0]?.id || ""}
+                                  onChange={(e) => updateFundingSplit(item.id, split.id, "shareHoldingId", e.target.value)}
+                                >
+                                  {shares.map((h) => (
+                                    <option key={h.id} value={h.id}>{h.ticker || "Holding"}</option>
+                                  ))}
+                                </select>
+                                <div className="funding-split-tenure">
+                                  <input
+                                    className="text-input"
+                                    type="number"
+                                    step="0.01"
+                                    min="0"
+                                    value={split.overridePrice !== undefined && split.overridePrice !== "" ? split.overridePrice : extrapolatedPrice.toFixed(2)}
+                                    onChange={(e) => updateFundingSplit(item.id, split.id, "overridePrice", e.target.value)}
+                                  />
+                                  <span>$/sh in {item.year}</span>
+                                </div>
+                                <span className="split-amount" style={{ marginLeft: 0 }}>≈ {qty.toFixed(2)} sh</span>
+                              </>
+                            );
+                          })}
                           {split.source === "loan" && (
                             <>
                               <RateInput value={split.interestRate} onChange={(v) => updateFundingSplit(item.id, split.id, "interestRate", v)} />
@@ -2728,12 +2807,19 @@ export default function InvestmentPlanner() {
                               </div>
                             </>
                           )}
-                          <span className="split-amount">{money(num(item.amount) * (num(split.percent) / 100))}</span>
+                          <span className="split-amount">{money(splitAmt)}</span>
                           {splits.length > 1 && (
                             <button type="button" className="remove-btn" onClick={() => removeFundingSplit(item.id, split.id)} aria-label="Remove this funding source">✕</button>
                           )}
                         </div>
-                      ))}
+                        {insufficient && (
+                          <div className="split-insufficient-warning">
+                            ⚠ Only ≈{money(Math.max(0, available))} projected available from this source by {item.year} — this split would be capped there, leaving {money(splitAmt - Math.max(0, available))} unfunded. Reduce the amount or pick an alternative source.
+                          </div>
+                        )}
+                        </div>
+                        );
+                      })}
                       <button type="button" className="explain-toggle" onClick={() => addFundingSplit(item.id)} style={{ marginTop: 4 }}>+ Add another funding source</button>
                     </div>
                     <div className="holding-readout">
@@ -2742,6 +2828,7 @@ export default function InvestmentPlanner() {
                         {splits.some((s) => s.source === "cd") && "CD portion reduces CDs. "}
                         {splits.some((s) => s.source === "rd" && !s.rdAccountId) && "Recurring deposit portion reduces proportionally across all RDs. "}
                         {splits.some((s) => s.source === "rd" && s.rdAccountId) && "Recurring deposit portion reduces the specific account chosen. "}
+                        {splits.some((s) => s.source === "shares") && "Share-sale portion reduces the Shares row at the extrapolated (or overridden) price — proceeds cover the purchase directly, same as cash. "}
                         {splits.some((s) => s.source === "loan") && splits.some((s) => s.source === "loan" && num(s.tenureYears) > 0)
                           ? "Loan portion adds a liability row that amortizes down to zero over its term, with the annual installment deducted from Savings & Checking each year of the term. "
                           : splits.some((s) => s.source === "loan") && "Loan portion adds a liability row that compounds at its own rate with no term entered — set a tenure above to amortize it with real payments instead. "}
@@ -3256,6 +3343,10 @@ export default function InvestmentPlanner() {
                 <Field label="Entertainment & hobbies"><MoneyInput value={expenses.entertainment} onChange={(v) => updateExpense("entertainment", v)} /></Field>
                 <Field label="Gifts & donations"><MoneyInput value={expenses.giftsDonations} onChange={(v) => updateExpense("giftsDonations", v)} /></Field>
                 <Field label="Other"><MoneyInput value={expenses.other} onChange={(v) => updateExpense("other", v)} /></Field>
+              </div>
+              <div className="expenses-total-row">
+                <span>Total monthly expenses</span>
+                <span className="expenses-total-value">{money(summary.totalExpenses)}</span>
               </div>
             </div>
           )}
