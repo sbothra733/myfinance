@@ -359,6 +359,54 @@ export default function InvestmentPlanner() {
   const removeShare = (id) => setShares((s) => s.filter((x) => x.id !== id));
   const updateShare = (id, key, val) => setShares((s) => s.map((x) => (x.id === id ? { ...x, [key]: val } : x)));
 
+  const [shareUploadStatus, setShareUploadStatus] = useState("");
+  const parseShareCsv = (text) => {
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const rows = [];
+    for (const line of lines) {
+      const parts = line.split(",").map((p) => p.trim().replace(/^"|"$/g, ""));
+      if (parts.length < 2) continue;
+      const [ticker, quantityRaw] = parts;
+      const quantity = parseFloat(quantityRaw);
+      if (!ticker || Number.isNaN(quantity)) continue; // skips a header row like "Ticker,Quantity" automatically
+      rows.push({ ticker: ticker.toUpperCase(), quantity });
+    }
+    return rows;
+  };
+  const handleShareCsvUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const rows = parseShareCsv(String(evt.target.result));
+      if (rows.length === 0) {
+        setShareUploadStatus("No valid rows found — expected two columns: ticker, quantity.");
+        setTimeout(() => setShareUploadStatus(""), 4000);
+        return;
+      }
+      setShares((s) => {
+        let updated = [...s];
+        let added = 0, matched = 0;
+        for (const row of rows) {
+          const idx = updated.findIndex((h) => (h.ticker || "").toUpperCase() === row.ticker);
+          if (idx >= 0) {
+            updated[idx] = { ...updated[idx], quantity: String(row.quantity) };
+            matched++;
+          } else {
+            updated.push({ id: uid(), ticker: row.ticker, quantity: String(row.quantity), price: "", dividendValue: "" });
+            added++;
+          }
+        }
+        setShareUploadStatus(`Imported ${rows.length} row${rows.length === 1 ? "" : "s"} — ${added} added, ${matched} updated. Use "Look up all" to fill in prices.`);
+        setTimeout(() => setShareUploadStatus(""), 6000);
+        return updated;
+      });
+    };
+    reader.onerror = () => setShareUploadStatus("Couldn't read that file.");
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
   const lookupShare = async (id, ticker) => {
     const symbol = (ticker || "").trim();
     if (!symbol) return;
@@ -398,6 +446,23 @@ export default function InvestmentPlanner() {
     } catch (err) {
       setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: "Couldn't fetch — enter manually" } }));
     }
+  };
+
+  const [lookupAllStatus, setLookupAllStatus] = useState("");
+  const [lookupAllBusy, setLookupAllBusy] = useState(false);
+  const lookupAllShares = async () => {
+    const targets = shares.filter((h) => (h.ticker || "").trim());
+    if (targets.length === 0) return;
+    setLookupAllBusy(true);
+    for (let i = 0; i < targets.length; i++) {
+      setLookupAllStatus(`Looking up ${i + 1} of ${targets.length} (${targets[i].ticker})…`);
+      await lookupShare(targets[i].id, targets[i].ticker);
+      // small stagger between calls rather than firing all at once
+      if (i < targets.length - 1) await new Promise((r) => setTimeout(r, 400));
+    }
+    setLookupAllStatus(`Refreshed ${targets.length} holding${targets.length === 1 ? "" : "s"}.`);
+    setLookupAllBusy(false);
+    setTimeout(() => setLookupAllStatus(""), 4000);
   };
 
   const addProperty = () =>
@@ -1751,6 +1816,10 @@ export default function InvestmentPlanner() {
           font-size: 11.5px; color: var(--text); font-family: inherit;
         }
 
+        .shares-header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; }
+        .shares-upload-label { cursor: pointer; }
+        .shares-upload-btn { display: inline-block; }
+
         .auth-wrap {
           min-height: 70vh; display: flex; align-items: center; justify-content: center; padding: 20px;
         }
@@ -2260,7 +2329,12 @@ export default function InvestmentPlanner() {
             ))}
             <option value="__new__">+ New account…</option>
           </select>
-          <button type="button" className="lookup-btn" onClick={saveAccount}>
+          <button
+            type="button"
+            className="lookup-btn"
+            onClick={saveAccount}
+            title="Your data is encrypted and stored securely under your account. If you'd rather not save it at all, use Export profile to keep a copy locally instead — Import profile brings it back in anytime."
+          >
             {activeAccountId ? "Save" : "Save as…"}
           </button>
           <button type="button" className="lookup-btn" onClick={() => setShowExport((s) => !s)}>
@@ -3225,6 +3299,17 @@ export default function InvestmentPlanner() {
             <div>
               <h2 className="section-title">Shares / brokerage holdings</h2>
               <p className="section-hint">Enter a ticker and quantity, then look up the current price and dividend automatically — or type them in yourself.</p>
+              <div className="shares-header-actions">
+                <label className="shares-upload-label">
+                  <span className="lookup-btn shares-upload-btn">Upload CSV (ticker, quantity)</span>
+                  <input type="file" accept=".csv,text/csv" onChange={handleShareCsvUpload} style={{ display: "none" }} />
+                </label>
+                <button type="button" className="lookup-btn" disabled={lookupAllBusy || shares.every((h) => !h.ticker.trim())} onClick={lookupAllShares}>
+                  {lookupAllBusy ? "Looking up…" : "Look up all"}
+                </button>
+                {shareUploadStatus && <span className="fetch-note ok">{shareUploadStatus}</span>}
+                {lookupAllStatus && <span className="fetch-note ok">{lookupAllStatus}</span>}
+              </div>
               {shares.map((h) => {
                 const holdingValue = num(h.quantity) * num(h.price);
                 const quarterlyIncome = num(h.quantity) * num(h.dividendValue);
