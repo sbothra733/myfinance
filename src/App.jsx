@@ -18,6 +18,23 @@ const currencyForCountry = (country) => COUNTRY_CURRENCY.find((c) => c.country =
 // Rough current benchmarks (as of mid-2026); the Profile tab lets the user override either.
 const MORTGAGE_RATE_BY_COUNTRY = { "United States": "6.75", "India": "8.0" };
 const mortgageRateForCountry = (country) => MORTGAGE_RATE_BY_COUNTRY[country] || "6.75";
+// Headline CPI-style inflation benchmarks — US figure is June 2026 BLS CPI; India figure is the most
+// recent official MoSPI reading (May 2026: 3.93%, rounded, with the series trending upward through
+// the year toward ~4.5% by some third-party trackers) — both are just starting points, always overridable.
+const INFLATION_RATE_BY_COUNTRY = { "United States": "3.5", "India": "4.0" };
+const inflationRateForCountry = (country) => INFLATION_RATE_BY_COUNTRY[country] || "3.5";
+// "Market CD rate" for the US; the India equivalent is a Fixed Deposit (FD) — major bank (SBI/HDFC/
+// ICICI-tier) general-public 1-year FD rates run roughly 6-7.5% as of 2026, vs. the ~4% a rate-shopper
+// can find in the US. Field label switches to "FD" for India; the underlying variable name is unchanged.
+const CD_RATE_BY_COUNTRY = { "United States": "4.0", "India": "6.5" };
+const cdRateForCountry = (country) => CD_RATE_BY_COUNTRY[country] || "4.0";
+// A basic savings account, not a rate-shopped CD/FD. US: the FDIC national average sits around
+// 0.4-0.65% (big banks often pay near 0.01%), but a competitive high-yield savings account —
+// still fully liquid, no lock-in — pays roughly 4% as of September 2026, so that's the default here
+// rather than the much lower "sleepy" average. India: major-bank regular savings accounts typically
+// pay 2.5-3.5%; small finance banks sometimes more.
+const SAVINGS_RATE_BY_COUNTRY = { "United States": "4.0", "India": "3.0" };
+const savingsRateForCountry = (country) => SAVINGS_RATE_BY_COUNTRY[country] || "4.0";
 
 const getCurrencySymbol = (code) => {
   try {
@@ -252,7 +269,7 @@ export default function InvestmentPlanner() {
   const [incomeGrowthRate, setIncomeGrowthRate] = useState(CURRENT_INFLATION_RATE);
 
   // 2. CDs
-  const [cds, setCds] = useState([{ id: uid(), label: "CD 1", amount: "", rate: marketCdRate }]);
+  const [cds, setCds] = useState([{ id: uid(), label: "CD 1", amount: "", rate: marketCdRate, startDate: new Date().toISOString().slice(0, 10), tenureValue: "", tenureUnit: "years" }]);
   const [recurringDeposits, setRecurringDeposits] = useState([]);
   const [plannedItems, setPlannedItems] = useState([]);
   const [collapsedPlannedIds, setCollapsedPlannedIds] = useState([]);
@@ -260,6 +277,8 @@ export default function InvestmentPlanner() {
   // 3. savings / checking
   const [savings, setSavings] = useState("");
   const [checking, setChecking] = useState("");
+  const [savingsInterestRate, setSavingsInterestRate] = useState("4.0");
+  const [fdTdsRate, setFdTdsRate] = useState("10");
 
   // 4. properties
   const [properties, setProperties] = useState([
@@ -268,7 +287,7 @@ export default function InvestmentPlanner() {
 
   // 5. shares
   const [shares, setShares] = useState([
-    { id: uid(), ticker: "", quantity: "", price: "", dividendValue: "" },
+    { id: uid(), assetType: "share", ticker: "", quantity: "", price: "", dividendValue: "" },
   ]);
   const [sharesReturn, setSharesReturn] = useState("7");
   const [projectionYears, setProjectionYears] = useState("5");
@@ -279,7 +298,7 @@ export default function InvestmentPlanner() {
 
   // 7. expenses
   const [expenses, setExpenses] = useState({
-    utilities: "", groceries: "", dining: "", gas: "",
+    rent: "", utilities: "", groceries: "", dining: "", gas: "",
     insurance: "", subscriptions: "", shopping: "", personalCare: "",
     travel: "", childcareEducation: "", healthcare: "", petCare: "", entertainment: "", giftsDonations: "", other: "",
   });
@@ -289,7 +308,7 @@ export default function InvestmentPlanner() {
     { key: "income", label: "Income" },
     { key: "liquid", label: "Cash & Deposits" },
     { key: "property", label: "Property" },
-    { key: "shares", label: "Shares" },
+    { key: "shares", label: country === "India" ? "Investments" : "Shares" },
     { key: "debt", label: "Debt" },
     { key: "expenses", label: "Expenses" },
     { key: "retirement", label: "Retirement" },
@@ -297,7 +316,7 @@ export default function InvestmentPlanner() {
   ];
 
   // ---------- row managers ----------
-  const addCd = () => setCds((c) => [...c, { id: uid(), label: `CD ${c.length + 1}`, amount: "", rate: marketCdRate }]);
+  const addCd = () => setCds((c) => [...c, { id: uid(), label: `${country === "India" ? "FD" : "CD"} ${c.length + 1}`, amount: "", rate: marketCdRate, startDate: todayStr(), tenureValue: "", tenureUnit: "years" }]);
   const removeCd = (id) => setCds((c) => c.filter((x) => x.id !== id));
   const updateCd = (id, key, val) => setCds((c) => c.map((x) => (x.id === id ? { ...x, [key]: val } : x)));
 
@@ -355,21 +374,23 @@ export default function InvestmentPlanner() {
       })
     );
 
-  const addShare = () => setShares((s) => [...s, { id: uid(), ticker: "", quantity: "", price: "", dividendValue: "" }]);
+  const addShare = () => setShares((s) => [...s, { id: uid(), assetType: "share", ticker: "", quantity: "", price: "", dividendValue: "" }]);
   const removeShare = (id) => setShares((s) => s.filter((x) => x.id !== id));
   const updateShare = (id, key, val) => setShares((s) => s.map((x) => (x.id === id ? { ...x, [key]: val } : x)));
 
   const [shareUploadStatus, setShareUploadStatus] = useState("");
+  // A scheme code is purely numeric (e.g. 119551); anything else is treated as a stock ticker.
   const parseShareCsv = (text) => {
     const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     const rows = [];
     for (const line of lines) {
       const parts = line.split(",").map((p) => p.trim().replace(/^"|"$/g, ""));
       if (parts.length < 2) continue;
-      const [ticker, quantityRaw] = parts;
+      const [identifier, quantityRaw] = parts;
       const quantity = parseFloat(quantityRaw);
-      if (!ticker || Number.isNaN(quantity)) continue; // skips a header row like "Ticker,Quantity" automatically
-      rows.push({ ticker: ticker.toUpperCase(), quantity });
+      if (!identifier || Number.isNaN(quantity)) continue; // skips a header row like "Ticker,Quantity" automatically
+      const isSchemeCode = /^\d+$/.test(identifier);
+      rows.push({ ticker: isSchemeCode ? identifier : identifier.toUpperCase(), quantity, assetType: isSchemeCode ? "mutualFund" : "share" });
     }
     return rows;
   };
@@ -380,7 +401,7 @@ export default function InvestmentPlanner() {
     reader.onload = (evt) => {
       const rows = parseShareCsv(String(evt.target.result));
       if (rows.length === 0) {
-        setShareUploadStatus("No valid rows found — expected two columns: ticker, quantity.");
+        setShareUploadStatus("No valid rows found — expected two columns: ticker/scheme code, quantity.");
         setTimeout(() => setShareUploadStatus(""), 4000);
         return;
       }
@@ -388,12 +409,12 @@ export default function InvestmentPlanner() {
         let updated = [...s];
         let added = 0, matched = 0;
         for (const row of rows) {
-          const idx = updated.findIndex((h) => (h.ticker || "").toUpperCase() === row.ticker);
+          const idx = updated.findIndex((h) => (h.ticker || "").toUpperCase() === String(row.ticker).toUpperCase());
           if (idx >= 0) {
-            updated[idx] = { ...updated[idx], quantity: String(row.quantity) };
+            updated[idx] = { ...updated[idx], quantity: String(row.quantity), assetType: row.assetType };
             matched++;
           } else {
-            updated.push({ id: uid(), ticker: row.ticker, quantity: String(row.quantity), price: "", dividendValue: "" });
+            updated.push({ id: uid(), assetType: row.assetType, ticker: row.ticker, quantity: String(row.quantity), price: "", dividendValue: "" });
             added++;
           }
         }
@@ -407,44 +428,56 @@ export default function InvestmentPlanner() {
     e.target.value = "";
   };
 
-  const lookupShare = async (id, ticker) => {
-    const symbol = (ticker || "").trim();
-    if (!symbol) return;
+  // Yahoo Finance's chart endpoint (shares) and MFAPI.in (Indian mutual funds) are both free, no
+  // API key required, called directly from the browser. Yahoo's endpoint isn't an official public
+  // API and its CORS policy can vary by browser/network — if it fails, the error is caught the same
+  // as any other lookup failure and the price/dividend can always be entered manually instead.
+  const lookupShareByTicker = async (id, ticker) => {
+    const symbol = ticker.trim().toUpperCase();
+    const { data: sessionData } = await supabase.auth.getSession();
+    const token = sessionData?.session?.access_token;
+    const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/lookup-share`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token || import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      },
+      // market "IN" routes the Edge Function to Yahoo Finance (server-side, no CORS issue there);
+      // anything else routes to Finnhub, which is what actually covers US shares on the free tier.
+      body: JSON.stringify({ symbol, market: country === "India" ? "IN" : "US" }),
+    });
+    const parsed = await response.json();
+    if (!response.ok || !parsed.found) throw new Error(parsed?.error || "not found");
+
+    setShares((s) => s.map((x) => (x.id === id ? { ...x, price: String(parsed.price), dividendValue: String(parsed.quarterlyDividendPerShare ?? 0) } : x)));
+    const sourceLabel = parsed.source ? `${parsed.source} · ${parsed.asOf || ""}`.trim() : parsed.asOf || "Updated";
+    const noteSuffix = parsed.quarterlyDividendPerShare === 0 && parsed.dividendNote ? ` (dividend: ${parsed.dividendNote})` : "";
+    setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: sourceLabel + noteSuffix } }));
+  };
+
+  const lookupMutualFundByScheme = async (id, schemeCode) => {
+    const code = schemeCode.trim();
+    const res = await fetch(`https://api.mfapi.in/mf/${encodeURIComponent(code)}/latest`);
+    if (!res.ok) throw new Error(`MFAPI returned ${res.status}`);
+    const data = await res.json();
+    const latest = data?.data?.[0];
+    if (!latest || !latest.nav) throw new Error("not found");
+    setShares((s) => s.map((x) => (x.id === id ? { ...x, price: String(latest.nav), dividendValue: "0" } : x)));
+    setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: `MFAPI.in · NAV as of ${latest.date || "today"}` } }));
+  };
+
+  const lookupShare = async (id, identifier, assetType) => {
+    const value = (identifier || "").trim();
+    if (!value) return;
     setFetchStatus((f) => ({ ...f, [id]: { state: "loading" } }));
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const token = sessionData?.session?.access_token;
-      const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/lookup-share`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token || import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-        },
-        body: JSON.stringify({ symbol }),
-      });
-      const parsed = await response.json();
-
-      if (!response.ok || !parsed.found) {
-        setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: parsed?.error || "Ticker not found" } }));
-        return;
-      }
-
-      setShares((s) =>
-        s.map((x) =>
-          x.id === id
-            ? {
-                ...x,
-                price: String(parsed.price ?? x.price),
-                dividendValue: String(parsed.quarterlyDividendPerShare ?? 0),
-              }
-            : x
-        )
-      );
-      const sourceLabel = parsed.source ? `${parsed.source} · ${parsed.asOf || ""}`.trim() : parsed.asOf || "Updated";
-      const noteSuffix = parsed.quarterlyDividendPerShare === 0 && parsed.dividendNote ? ` (dividend: ${parsed.dividendNote})` : "";
-      setFetchStatus((f) => ({ ...f, [id]: { state: "done", message: sourceLabel + noteSuffix } }));
+      if (assetType === "mutualFund") await lookupMutualFundByScheme(id, value);
+      else await lookupShareByTicker(id, value);
     } catch (err) {
-      setFetchStatus((f) => ({ ...f, [id]: { state: "error", message: "Couldn't fetch — enter manually" } }));
+      setFetchStatus((f) => ({
+        ...f,
+        [id]: { state: "error", message: assetType === "mutualFund" ? "Scheme not found — enter manually" : `Couldn't fetch: ${err?.message || "unknown error"} — enter manually` },
+      }));
     }
   };
 
@@ -456,7 +489,7 @@ export default function InvestmentPlanner() {
     setLookupAllBusy(true);
     for (let i = 0; i < targets.length; i++) {
       setLookupAllStatus(`Looking up ${i + 1} of ${targets.length} (${targets[i].ticker})…`);
-      await lookupShare(targets[i].id, targets[i].ticker);
+      await lookupShare(targets[i].id, targets[i].ticker, targets[i].assetType);
       // small stagger between calls rather than firing all at once
       if (i < targets.length - 1) await new Promise((r) => setTimeout(r, 400));
     }
@@ -483,7 +516,7 @@ export default function InvestmentPlanner() {
 
   const serializeProfile = () => ({
     age, riskTolerance, marketMortgageRate, marketCdRate, emergencyMonths, payoffThreshold, country, currency,
-    grossIncome, netIncome, incomeGrowthRate, cds, recurringDeposits, plannedItems, savings, checking, properties,
+    grossIncome, netIncome, incomeGrowthRate, cds, recurringDeposits, plannedItems, savings, checking, savingsInterestRate, fdTdsRate, properties,
     shares, sharesReturn, projectionYears, loans, expenses,
     retirementExpense, withdrawalRate, propertyAppreciationRate,
     rentGrowthRate, expenseGrowthRate, propertyCostGrowthRate, k401Balance, k401GrowthRate,
@@ -494,47 +527,52 @@ export default function InvestmentPlanner() {
 
   const applyProfile = (d) => {
     if (!d) return;
+    const profileCountry = d.country ?? "United States";
+    const fallbackInflation = inflationRateForCountry(profileCountry);
+    const fallbackCdRate = cdRateForCountry(profileCountry);
     setAge(d.age ?? "");
     setSnapshotDate(d.snapshotDate || todayStr());
-    setCountry(d.country ?? "United States");
+    setCountry(profileCountry);
     setCurrency(d.currency ?? "USD");
     setRiskTolerance(d.riskTolerance ?? "moderate");
-    setMarketMortgageRate(d.marketMortgageRate ?? "6.75");
-    setMarketCdRate(d.marketCdRate ?? "4.0");
+    setMarketMortgageRate(d.marketMortgageRate ?? mortgageRateForCountry(profileCountry));
+    setMarketCdRate(d.marketCdRate ?? fallbackCdRate);
     setEmergencyMonths(d.emergencyMonths ?? "6");
     setPayoffThreshold(d.payoffThreshold ?? "10000");
     setGrossIncome(d.grossIncome ?? "");
     setNetIncome(d.netIncome ?? "");
-    setIncomeGrowthRate(d.incomeGrowthRate ?? CURRENT_INFLATION_RATE);
-    setCds(d.cds && d.cds.length ? d.cds : [{ id: uid(), label: "CD 1", amount: "", rate: marketCdRate }]);
+    setIncomeGrowthRate(d.incomeGrowthRate ?? fallbackInflation);
+    setCds(d.cds && d.cds.length ? d.cds : [{ id: uid(), label: profileCountry === "India" ? "FD 1" : "CD 1", amount: "", rate: marketCdRate, startDate: todayStr(), tenureValue: "", tenureUnit: "years" }]);
     setRecurringDeposits(d.recurringDeposits || []);
     setPlannedItems(d.plannedItems || []);
     setSavings(d.savings ?? "");
     setChecking(d.checking ?? "");
+    setSavingsInterestRate(d.savingsInterestRate ?? savingsRateForCountry(profileCountry));
+    setFdTdsRate(d.fdTdsRate ?? "10");
     setProperties(
       d.properties && d.properties.length
         ? d.properties
         : [{ id: uid(), label: "Primary residence", type: "self", value: "", loanBalance: "", monthlyMortgage: "", mortgageRate: "", rentalIncome: "", propertyTax: "", propertyInsurance: "", hoa: "", managementFee: "" }]
     );
-    setShares(d.shares && d.shares.length ? d.shares : [{ id: uid(), ticker: "", quantity: "", price: "", dividendValue: "" }]);
+    setShares(d.shares && d.shares.length ? d.shares : [{ id: uid(), assetType: "share", ticker: "", quantity: "", price: "", dividendValue: "" }]);
     setSharesReturn(d.sharesReturn ?? "7");
     setProjectionYears(d.projectionYears ?? "5");
     setLoans(d.loans && d.loans.length ? d.loans : [{ id: uid(), label: "Car loan", balance: "", rate: "", payment: "" }]);
     setExpenses({
-      utilities: "", groceries: "", dining: "", gas: "", insurance: "", subscriptions: "", shopping: "", personalCare: "",
+      rent: "", utilities: "", groceries: "", dining: "", gas: "", insurance: "", subscriptions: "", shopping: "", personalCare: "",
       travel: "", childcareEducation: "", healthcare: "", petCare: "", entertainment: "", giftsDonations: "", other: "",
       ...(d.expenses || {}),
     });
     setRetirementExpense(d.retirementExpense ?? "");
     setWithdrawalRate(d.withdrawalRate ?? "4");
     setPropertyAppreciationRate(d.propertyAppreciationRate ?? "3");
-    setRentGrowthRate(d.rentGrowthRate ?? CURRENT_INFLATION_RATE);
-    setExpenseGrowthRate(d.expenseGrowthRate ?? CURRENT_INFLATION_RATE);
-    setPropertyCostGrowthRate(d.propertyCostGrowthRate ?? CURRENT_INFLATION_RATE);
+    setRentGrowthRate(d.rentGrowthRate ?? fallbackInflation);
+    setExpenseGrowthRate(d.expenseGrowthRate ?? fallbackInflation);
+    setPropertyCostGrowthRate(d.propertyCostGrowthRate ?? fallbackInflation);
     setK401Balance(d.k401Balance ?? "");
     setK401GrowthRate(d.k401GrowthRate ?? "7");
     setK401Contribution(d.k401Contribution ?? "");
-    setK401ContributionGrowthRate(d.k401ContributionGrowthRate ?? CURRENT_INFLATION_RATE);
+    setK401ContributionGrowthRate(d.k401ContributionGrowthRate ?? fallbackInflation);
     setSocialSecurityBenefit(d.socialSecurityBenefit ?? "");
     setTargetRetirementAge(d.targetRetirementAge ?? "");
     setSsTaxRate(d.ssTaxRate ?? "15");
@@ -850,6 +888,32 @@ export default function InvestmentPlanner() {
 
     // --- recurring deposits ---
     const today = new Date(snapshotDateObj);
+
+    // --- CDs / FDs: lump-sum deposits, annually compounded (consistent with the rest of the app's
+    // year-granular projections), optionally with a start date + tenure for a real maturity date. TDS
+    // (India only) is deducted from total accrued interest at maturity, not from the running balance.
+    const fdTdsRatePct = num(fdTdsRate) || 0;
+    const cdComputed = cds.map((c) => {
+      const principal = num(c.amount);
+      const rate = num(c.rate);
+      const hasTenure = c.startDate && num(c.tenureValue) > 0;
+      const endDateObj = hasTenure ? rdEndDate(c.startDate, c.tenureValue, c.tenureUnit) : null;
+      const startDateObj = c.startDate ? new Date(c.startDate + "T00:00:00") : null;
+      const tenureYears = hasTenure ? (c.tenureUnit === "years" ? num(c.tenureValue) : num(c.tenureValue) / 12) : null;
+      let yearsElapsed = 0;
+      if (startDateObj && !isNaN(startDateObj.getTime())) {
+        yearsElapsed = Math.max(0, (today - startDateObj) / (1000 * 60 * 60 * 24 * 365.25));
+        if (hasTenure) yearsElapsed = Math.min(yearsElapsed, tenureYears);
+      }
+      const currentValue = principal > 0 ? principal * Math.pow(1 + rate / 100, yearsElapsed) : 0;
+      const grossMaturityValue = hasTenure && principal > 0 ? principal * Math.pow(1 + rate / 100, tenureYears) : null;
+      const maturityInterest = grossMaturityValue !== null ? grossMaturityValue - principal : null;
+      const maturityTds = grossMaturityValue !== null && country === "India" ? maturityInterest * (fdTdsRatePct / 100) : 0;
+      const netMaturityValue = grossMaturityValue !== null ? grossMaturityValue - maturityTds : null;
+      const isMatured = endDateObj ? today >= endDateObj : false;
+      return { ...c, endDateObj, startDateObj, tenureYears, currentValue, grossMaturityValue, maturityInterest, maturityTds, netMaturityValue, isMatured };
+    });
+
     const rdComputed = recurringDeposits.map((r) => {
       const periodsPerYear = RD_PERIODS_PER_YEAR[r.frequency] || 12;
       const avgDaysPerPeriod = RD_AVG_DAYS_PER_PERIOD[r.frequency] || 30.44;
@@ -1001,7 +1065,7 @@ export default function InvestmentPlanner() {
             sourceType: "cd",
             amount: useCd,
             resultingBalance,
-            note: `Paying ${pct(d.rate)} on this debt while CDs earn ${pct(weightedCdRate)} — redirecting CD funds here is close to a guaranteed gain (check early-withdrawal penalties first). Balance would drop from ${money(bal)} to ${money(resultingBalance)}.`,
+            note: `Paying ${pct(d.rate)} on this debt while ${country === "India" ? "FDs" : "CDs"} earn ${pct(weightedCdRate)} — redirecting ${country === "India" ? "FD" : "CD"} funds here is close to a guaranteed gain (check early-withdrawal penalties first). Balance would drop from ${money(bal)} to ${money(resultingBalance)}.`,
           });
           remainingCds -= useCd;
           bal = resultingBalance;
@@ -1179,7 +1243,7 @@ export default function InvestmentPlanner() {
       const toRetirement = surplus * 0.7;
       const toLiquidInvest = surplus * 0.3;
       plan.push({ label: "Diversified investing (index funds / retirement accounts)", amount: toRetirement, note: "Long-term growth allocation" });
-      plan.push({ label: "CDs / short-term savings", amount: toLiquidInvest, note: "Capital preservation & liquidity" });
+      plan.push({ label: `${country === "India" ? "FDs" : "CDs"} / short-term savings`, amount: toLiquidInvest, note: "Capital preservation & liquidity" });
     }
 
     // --- retirement readiness / FI number ---
@@ -1327,6 +1391,7 @@ export default function InvestmentPlanner() {
 
     return {
       totalCds, weightedCdRate, liquid,
+      cdComputed,
       rdComputed, totalRDCurrentValue, totalRDMaturityValue, totalRDMonthlyDeposit, weightedRDRate,
       totalPropertyValue, totalPropertyLoans, totalPropertyEquity, totalMortgagePayments, totalPropertyTax, totalPropertyInsurance, totalHoa, totalManagementFees, totalPropertyCarryCosts, totalRentalIncome,
       totalShares, totalQuarterlyDividendIncome, totalAnnualDividendIncome, monthlyDividendIncome, totalLoanBalance, totalLoanPayments, highInterestLoans,
@@ -1344,7 +1409,7 @@ export default function InvestmentPlanner() {
     };
   }, [
     cds, recurringDeposits, savings, checking, properties, shares, sharesReturn, projectionYears, loans, expenses, netIncome, grossIncome,
-    age, riskTolerance, marketMortgageRate, marketCdRate, emergencyMonths, payoffThreshold, retirementExpense, withdrawalRate, country,
+    age, riskTolerance, marketMortgageRate, marketCdRate, emergencyMonths, payoffThreshold, fdTdsRate, retirementExpense, withdrawalRate, country,
     rentGrowthRate, expenseGrowthRate, propertyCostGrowthRate, incomeGrowthRate, k401Balance, k401GrowthRate,
     k401Contribution, k401ContributionGrowthRate,
     socialSecurityBenefit, targetRetirementAge, ssTaxRate, refreshNonce,
@@ -1431,7 +1496,41 @@ export default function InvestmentPlanner() {
     const cdRate = (num(marketCdRate) || summary.weightedCdRate) / 100; // new CD money earns today's market rate, not necessarily what old CDs happen to carry
     const shareReturn = summary.totalExpectedReturn / 100;
 
-    let cdsVal = summary.totalCds;
+    // CDs/FDs are tracked per account, each compounding at its own entered rate (not a single blended
+    // market rate) — this is what makes the category total mathematically exact, and what lets a CD
+    // with a start date + tenure actually mature and liquidate to cash on schedule. Ongoing monthly
+    // surplus contributions (the "CDs/short-term savings" 30% share) can't literally be added to an
+    // existing lump-sum CD, so they build a separate synthetic pool at today's market rate instead —
+    // standing in for new CDs opened over time at whatever rate is then prevailing.
+    let cdStates = summary.cdComputed.map((c) => ({
+      id: c.id,
+      label: c.label || (country === "India" ? "FD" : "CD"),
+      value: c.currentValue,
+      rate: num(c.rate),
+      endDateObj: c.endDateObj,
+      hasTenure: !!c.endDateObj,
+      liquidated: false,
+    }));
+    let ongoingCdPool = 0;
+    // Anything that has already matured as of today gets treated as already liquidated — a real bank
+    // would have already paid it out, so it shouldn't still show as a compounding CD/FD going forward.
+    let alreadyMaturedCash = 0;
+    cdStates = cdStates.map((c) => {
+      if (c.hasTenure && summary.cdComputed.find((x) => x.id === c.id)?.isMatured) {
+        alreadyMaturedCash += c.value;
+        return { ...c, liquidated: true, value: 0 };
+      }
+      return c;
+    });
+    const cdTotal = () => cdStates.reduce((s, c) => s + (c.liquidated ? 0 : c.value), 0) + ongoingCdPool;
+    const reduceCdProportionally = (amount) => {
+      const total = cdTotal();
+      if (total <= 0 || amount <= 0) return;
+      const frac = amount / total;
+      cdStates = cdStates.map((c) => (c.liquidated ? c : { ...c, value: Math.max(0, c.value - c.value * frac) }));
+      ongoingCdPool = Math.max(0, ongoingCdPool - ongoingCdPool * frac);
+    };
+    const depositsLiquidatedThisYear = []; // [{year, label, amount}] — surfaced as a "Deposit Liquidated" row
     // Recurring deposits are tracked per account, not as one blended pool — each compounds at its
     // own rate and receives its own contribution until its own maturity date, which is what makes
     // the category total mathematically exact rather than an approximation from a single weighted
@@ -1456,7 +1555,13 @@ export default function InvestmentPlanner() {
       rdStates = rdStates.map((r) => (r.id === accountId ? { ...r, value: Math.max(0, r.value - amount) } : r));
     };
     let sharesVal = summary.totalShares;
-    let liquidVal = summary.liquid;
+    let liquidVal = summary.liquid + alreadyMaturedCash;
+    // Only the savings portion of liquid cash earns interest — checking (US only) is assumed to earn
+    // nothing, same as always. Rather than tracking two separate mutable pools through every hit,
+    // refill, and contribution below, this holds today's savings/checking split constant over time and
+    // applies the interest rate to just that share of the combined balance each year — exact at year 0,
+    // a reasonable approximation after that since both accounts move together in practice.
+    const savingsShareOfLiquid = num(savings) + num(checking) > 0 ? num(savings) / (num(savings) + num(checking)) : 1;
     let k401Val = summary.k401Now;
     const k401Rate = summary.k401GrowthPct / 100;
 
@@ -1477,6 +1582,25 @@ export default function InvestmentPlanner() {
         const contribution = futureDate >= startDateObj ? r.monthlyDepositEquivalent * 12 : 0;
         return { ...r, value: r.value * (1 + r.rate / 100) + contribution };
       });
+    };
+
+    // Compounds each CD/FD at its own rate; a tenured one that reaches maturity this year is
+    // liquidated — removed from the CD pool and handed back as cash, once, the year it matures.
+    const growCdStatesForYear = (y) => {
+      const futureDate = new Date(today);
+      futureDate.setFullYear(futureDate.getFullYear() + y);
+      let liquidatedAmount = 0;
+      const liquidatedLabels = [];
+      cdStates = cdStates.map((c) => {
+        if (c.liquidated) return c;
+        if (c.hasTenure && futureDate >= c.endDateObj) {
+          liquidatedAmount += c.value;
+          liquidatedLabels.push(c.label);
+          return { ...c, liquidated: true, value: 0 };
+        }
+        return { ...c, value: c.value * (1 + c.rate / 100) };
+      });
+      return { amount: liquidatedAmount, labels: liquidatedLabels };
     };
 
     // this year's cash flow surplus, growing income/rent/expenses/property costs from today at their own rates
@@ -1573,7 +1697,7 @@ export default function InvestmentPlanner() {
       };
       for (const opp of summary.liquidationOpportunities) {
         if (opp.sourceType === "cash") liquidVal = Math.max(0, liquidVal - opp.amount);
-        else if (opp.sourceType === "cd") cdsVal = Math.max(0, cdsVal - opp.amount);
+        else if (opp.sourceType === "cd") reduceCdProportionally(opp.amount);
         else if (opp.sourceType === "rd") reduceRdProportionally(opp.amount);
         applyToDebt(opp.debtKey, opp.amount);
       }
@@ -1590,7 +1714,7 @@ export default function InvestmentPlanner() {
     // below only walks future years starting at 1. Loan installments (for tenured loan splits) are
     // also already due starting the origination year.
     liquidVal = Math.max(0, liquidVal - plannedCashHitAtYear(0));
-    cdsVal = Math.max(0, cdsVal - plannedCdHitAtYear(0));
+    reduceCdProportionally(plannedCdHitAtYear(0));
     reduceRdProportionally(plannedRdProportionalHitAtYear(0));
     Object.entries(plannedRdSpecificHitsAtYear(0)).forEach(([accountId, amt]) => reduceRdAccountById(accountId, amt));
     sharesVal = Math.max(0, sharesVal - plannedSharesHitAtYear(0));
@@ -1599,19 +1723,21 @@ export default function InvestmentPlanner() {
     const rows = [
       {
         year: 0, label: "Now",
-        liquid: liquidVal, cds: cdsVal, rd: rdTotal(), rdByAccount: rdStates.map((r) => ({ id: r.id, label: r.label, value: r.value })), shares: sharesVal, k401: k401Val,
+        liquid: liquidVal, cds: cdTotal(), cdByAccount: cdStates.filter((c) => !c.liquidated).map((c) => ({ id: c.id, label: c.label, value: c.value })),
+        rd: rdTotal(), rdByAccount: rdStates.map((r) => ({ id: r.id, label: r.label, value: r.value })), shares: sharesVal, k401: k401Val,
         propertyValue: propState.reduce((s, p) => s + p.value, 0),
         propertyLoans: propState.reduce((s, p) => s + p.loanBalance, 0),
         otherLoans: loanState.reduce((s, l) => s + l.balance, 0),
-        netWorth: liquidVal + cdsVal + rdTotal() + sharesVal + k401Val + propState.reduce((s, p) => s + (p.value - p.loanBalance), 0) - loanState.reduce((s, l) => s + l.balance, 0),
+        netWorth: liquidVal + cdTotal() + rdTotal() + sharesVal + k401Val + propState.reduce((s, p) => s + (p.value - p.loanBalance), 0) - loanState.reduce((s, l) => s + l.balance, 0),
         emergencyTarget: summary.emergencyTarget,
+        depositsLiquidated: 0,
       },
     ];
 
     for (let y = 1; y <= years; y++) {
       // planned cash/CD/RD/shares spending for this year hits first, plus any loan installments now due
       liquidVal = Math.max(0, liquidVal - plannedCashHitAtYear(y));
-      cdsVal = Math.max(0, cdsVal - plannedCdHitAtYear(y));
+      reduceCdProportionally(plannedCdHitAtYear(y));
       reduceRdProportionally(plannedRdProportionalHitAtYear(y));
       Object.entries(plannedRdSpecificHitsAtYear(y)).forEach(([accountId, amt]) => reduceRdAccountById(accountId, amt));
       sharesVal = Math.max(0, sharesVal - plannedSharesHitAtYear(y));
@@ -1629,10 +1755,15 @@ export default function InvestmentPlanner() {
         liquidVal += toRefill;
         surplus_y -= toRefill;
       }
+      // Savings account balance earns its own (modest) interest, compounded annually — checking (if
+      // any) does not, so only the savings-proportional share of liquid cash grows here.
+      liquidVal = liquidVal + liquidVal * savingsShareOfLiquid * (num(savingsInterestRate) / 100);
       const annualContribution_y = surplus_y * 0.7; // retirement/investing (shares)
       const annualCdContribution_y = surplus_y * 0.3; // CDs/short-term savings
 
-      cdsVal = cdsVal * (1 + cdRate) + annualCdContribution_y;
+      const cdMaturity = growCdStatesForYear(y);
+      liquidVal += cdMaturity.amount;
+      ongoingCdPool = ongoingCdPool * (1 + cdRate) + annualCdContribution_y;
       // yearly cumulative, per account: this year's balance = prior balance (with accrued interest)
       // + this year's contribution, computed individually for every recurring deposit.
       growRdStatesForYear(y);
@@ -1670,7 +1801,7 @@ export default function InvestmentPlanner() {
       if (applyPayoffs) {
         const payoffsThisYear = summary.futurePayoffProjection.filter((p) => Math.ceil(p.month / 12) === y);
         for (const p of payoffsThisYear) {
-          if (p.source === "CD funds") cdsVal = Math.max(0, cdsVal - p.amount);
+          if (p.source === "CD funds") reduceCdProportionally(p.amount);
           else if (p.source === "recurring deposit funds") reduceRdProportionally(p.amount);
           else sharesVal = Math.max(0, sharesVal - p.amount);
           loanState = loanState.map((l) => (l.key === p.debtKey ? { ...l, balance: Math.max(0, l.balance - p.amount) } : l));
@@ -1682,11 +1813,14 @@ export default function InvestmentPlanner() {
       const propertyLoans = propState.reduce((s, p) => s + p.loanBalance, 0);
       const otherLoans = loanState.reduce((s, l) => s + l.balance, 0);
       const rdTotalThisYear = rdTotal();
-      const netWorth = liquidVal + cdsVal + rdTotalThisYear + sharesVal + k401Val + (propertyValue - propertyLoans) - otherLoans;
+      const netWorth = liquidVal + cdTotal() + rdTotalThisYear + sharesVal + k401Val + (propertyValue - propertyLoans) - otherLoans;
       rows.push({
-        year: y, label: String(baseYear + y), liquid: liquidVal, cds: cdsVal, rd: rdTotalThisYear,
+        year: y, label: String(baseYear + y), liquid: liquidVal, cds: cdTotal(),
+        cdByAccount: cdStates.filter((c) => !c.liquidated).map((c) => ({ id: c.id, label: c.label, value: c.value })),
+        rd: rdTotalThisYear,
         rdByAccount: rdStates.map((r) => ({ id: r.id, label: r.label, value: r.value })),
         shares: sharesVal, k401: k401Val, propertyValue, propertyLoans, otherLoans, netWorth, emergencyTarget: target_y,
+        depositsLiquidated: cdMaturity.amount,
       });
     }
 
@@ -1705,18 +1839,18 @@ export default function InvestmentPlanner() {
       properties, loans, plannedItems,
       summary.totalCds, summary.totalRDCurrentValue, summary.weightedRDRate, summary.totalShares, summary.liquid, summary.weightedCdRate,
       summary.totalExpectedReturn, summary.monthlyCashFlow, summary.netWorth, summary.futurePayoffProjection,
-      summary.liquidationOpportunities, summary.restructureAnalysis, summary.rdComputed,
+      summary.liquidationOpportunities, summary.restructureAnalysis, summary.rdComputed, summary.cdComputed,
       summary.afterTax, summary.incomeGrowthPct, summary.totalRentalIncome, summary.rentGrowthPct,
       summary.totalExpenses, summary.expenseGrowthPct, summary.totalPropertyCarryCosts, summary.propCostGrowthPct,
       summary.totalMortgagePayments, summary.totalLoanPayments, summary.monthlyDividendIncome, summary.emergencyTarget,
       summary.k401Now, summary.k401GrowthPct, summary.k401ContributionNow, summary.k401ContributionGrowthPct,
-      netWorthYears, propertyAppreciationRate, marketCdRate, netWorthTablePayoffsApplied,
+      netWorthYears, propertyAppreciationRate, marketCdRate, netWorthTablePayoffsApplied, country, savingsInterestRate, savings, checking,
     ]
   );
 
   const ledgerLines = [
     { label: "Savings + checking", value: summary.liquid, positive: true },
-    { label: "CDs", value: summary.totalCds, positive: true },
+    { label: country === "India" ? "FDs" : "CDs", value: summary.totalCds, positive: true },
     { label: "Recurring deposits", value: summary.totalRDCurrentValue, positive: true },
     { label: "Shares", value: summary.totalShares, positive: true },
     { label: country === "India" ? "Provident Fund" : "401(k)", value: summary.k401Now, positive: true },
@@ -1968,6 +2102,11 @@ export default function InvestmentPlanner() {
         }
         .lookup-btn:hover:not(:disabled) { border-color: var(--gold); color: var(--gold); }
         .lookup-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        a.scheme-search-link {
+          display: inline-flex; align-items: center; text-decoration: none; color: var(--muted);
+          line-height: 28px;
+        }
+        a.scheme-search-link:hover { border-color: var(--gold); color: var(--gold); }
 
         .add-btn {
           margin-top: 12px; background: transparent; border: 1px dashed var(--border);
@@ -2076,6 +2215,8 @@ export default function InvestmentPlanner() {
         }
         .bs-expand-toggle:hover { color: var(--gold); }
         .bs-child-row td { color: var(--muted); font-weight: 400; }
+        .bs-memo-row td { font-style: italic; font-size: 11px; }
+        .bs-memo-row .bs-child-label em { font-style: italic; color: var(--muted); font-size: 10px; }
         .bs-child-label { padding-left: 26px !important; }
         .balance-sheet-table .bs-row-label {
           text-align: left; font-family: 'Public Sans', sans-serif; color: var(--muted); white-space: nowrap;
@@ -2499,6 +2640,20 @@ export default function InvestmentPlanner() {
                       setCountry(newCountry);
                       setCurrency(currencyForCountry(newCountry));
                       setMarketMortgageRate(mortgageRateForCountry(newCountry));
+                      setMarketCdRate(cdRateForCountry(newCountry));
+                      setSavingsInterestRate(savingsRateForCountry(newCountry));
+                      const newInflation = inflationRateForCountry(newCountry);
+                      setRentGrowthRate(newInflation);
+                      setExpenseGrowthRate(newInflation);
+                      setPropertyCostGrowthRate(newInflation);
+                      setIncomeGrowthRate(newInflation);
+                      setK401ContributionGrowthRate(newInflation);
+                      // India has no checking-account equivalent — fold any existing checking balance
+                      // into savings rather than letting it silently keep counting from a hidden field.
+                      if (newCountry === "India" && num(checking) > 0) {
+                        setSavings(String(num(savings) + num(checking)));
+                        setChecking("");
+                      }
                     }}
                   >
                     {COUNTRY_CURRENCY.map((c) => (
@@ -2518,7 +2673,7 @@ export default function InvestmentPlanner() {
                 <Field label="Current market mortgage rate" suffix="30-yr fixed benchmark">
                   <RateInput value={marketMortgageRate} onChange={setMarketMortgageRate} />
                 </Field>
-                <Field label="Current market CD rate" suffix="used for new CDs and projected CD growth">
+                <Field label={country === "India" ? "Current market FD rate" : "Current market CD rate"} suffix={country === "India" ? "used for new FDs and projected FD growth" : "used for new CDs and projected CD growth"}>
                   <RateInput value={marketCdRate} onChange={setMarketCdRate} />
                 </Field>
               </div>
@@ -2552,7 +2707,7 @@ export default function InvestmentPlanner() {
                 <Field label="Expense growth rate" suffix="annual, defaults to current inflation">
                   <RateInput value={expenseGrowthRate} onChange={setExpenseGrowthRate} />
                 </Field>
-                <Field label="Property cost growth rate" suffix="tax/HOA/fees, defaults to current inflation">
+                <Field label="Property cost growth rate" suffix={country === "India" ? "tax/maintenance/fees, defaults to current inflation" : "tax/HOA/fees, defaults to current inflation"}>
                   <RateInput value={propertyCostGrowthRate} onChange={setPropertyCostGrowthRate} />
                 </Field>
               </div>
@@ -2560,7 +2715,9 @@ export default function InvestmentPlanner() {
                 {country === "India"
                   ? "Indian home loan rates were running roughly 7.1%–8.5% for well-qualified borrowers as of mid-2026, linked to the RBI repo rate — mortgage rates move often, so update this with a current quote for a more accurate refinance comparison."
                   : "National 30-year fixed averages were running roughly 6.6%–6.8% in late July 2026 — mortgage rates move often, so update this with a current quote for a more accurate refinance comparison."}{" "}
-                The market CD rate defaults to about 4.0% — a competitive top-tier rate as of mid-2026 (the sleepy national average is closer to 1.7–2%, but a rate-shopper can do much better) — and is used both as the starting rate for any new CD you add and as the growth rate for projected CD balances. The growth-rate defaults above ({CURRENT_INFLATION_RATE}%) are the latest US headline CPI reading (June 2026) — update them if you expect rent, spending, or property costs to grow faster or slower than general inflation.
+                {country === "India"
+                  ? "The market FD rate defaults to about 6.5% — a representative general-public 1-year rate from major banks (SBI/HDFC/ICICI-tier run roughly 6–7.5%; small finance banks often pay more, up to 8–9%) — and is used both as the starting rate for any new FD you add and as the growth rate for projected FD balances. The growth-rate defaults above (4.0%) track the most recent official MoSPI CPI reading (3.93% YoY, May 2026), with the series trending upward through the year — update them if you expect rent, spending, or property costs to grow faster or slower than general inflation."
+                  : `The market CD rate defaults to about 4.0% — a competitive top-tier rate as of mid-2026 (the sleepy national average is closer to 1.7–2%, but a rate-shopper can do much better) — and is used both as the starting rate for any new CD you add and as the growth rate for projected CD balances. The growth-rate defaults above (${CURRENT_INFLATION_RATE}%) are the latest US headline CPI reading (June 2026) — update them if you expect rent, spending, or property costs to grow faster or slower than general inflation.`}
               </p>
             </div>
           )}
@@ -2648,7 +2805,7 @@ export default function InvestmentPlanner() {
                 If you leave the target age blank, the app searches year by year for the soonest age where your projected portfolio covers that year's FI number. If you enter one, it instead tells you whether you're on pace to hit it.
               </p>
               <p className="section-hint" style={{ marginTop: 8 }}>
-                Compared against your liquid + CD + recurring deposit + shares + {country === "India" ? "Provident Fund" : "401(k)"} balances (not home equity, since that's assumed to stay lived-in rather than fund spending). The {country === "India" ? "Provident Fund" : "401(k)"} compounds separately at its own growth rate, with its own contribution schedule above, until retirement — see the Retirement readiness section in the ledger for the full breakdown.
+                Compared against your liquid + {country === "India" ? "FD" : "CD"} + recurring deposit + shares + {country === "India" ? "Provident Fund" : "401(k)"} balances (not home equity, since that's assumed to stay lived-in rather than fund spending). The {country === "India" ? "Provident Fund" : "401(k)"} compounds separately at its own growth rate, with its own contribution schedule above, until retirement — see the Retirement readiness section in the ledger for the full breakdown.
               </p>
             </div>
           )}
@@ -2680,7 +2837,7 @@ export default function InvestmentPlanner() {
                   {netWorthTablePayoffsApplied ? "↺ Reset to baseline (no payoffs applied)" : "↻ Recalculate with recommended payoffs"}
                 </button>
                 {netWorthTablePayoffsApplied && (
-                  <span className="fetch-note ok">Applied — CD, recurring deposit, and outstanding loan balances below now reflect the future payoff proposals.</span>
+                  <span className="fetch-note ok">Applied — {country === "India" ? "FD" : "CD"}, recurring deposit, and outstanding loan balances below now reflect the future payoff proposals.</span>
                 )}
               </div>
 
@@ -2700,7 +2857,7 @@ export default function InvestmentPlanner() {
                     const holding = shares.find((h) => h.id === s.shareHoldingId);
                     return `sale of ${holding?.ticker || "shares"}`;
                   }
-                  return { none: "external/untracked funds", cash: "cash", cd: "CD funds", rd: "recurring deposit funds (any)", loan: "a new loan" }[s.source] || s.source;
+                  return { none: "external/untracked funds", cash: "cash", cd: country === "India" ? "FD funds" : "CD funds", rd: "recurring deposit funds (any)", loan: "a new loan" }[s.source] || s.source;
                 };
                 if (isCollapsed) {
                   return (
@@ -2804,7 +2961,7 @@ export default function InvestmentPlanner() {
                           <select className="type-select" value={split.source} onChange={(e) => updateFundingSplit(item.id, split.id, "source", e.target.value)}>
                             <option value="none">External / untracked funds</option>
                             <option value="cash">Cash (savings/checking)</option>
-                            <option value="cd">CD funds</option>
+                            <option value="cd">{country === "India" ? "FD funds" : "CD funds"}</option>
                             <option value="rd">Recurring Deposit funds</option>
                             <option value="shares">Sale of shares</option>
                             <option value="loan">New loan</option>
@@ -2899,7 +3056,7 @@ export default function InvestmentPlanner() {
                     <div className="holding-readout">
                       <span>
                         {splits.some((s) => s.source === "cash") && "Cash portion reduces Savings & Checking. "}
-                        {splits.some((s) => s.source === "cd") && "CD portion reduces CDs. "}
+                        {splits.some((s) => s.source === "cd") && `${country === "India" ? "FD" : "CD"} portion reduces ${country === "India" ? "FDs" : "CDs"}. `}
                         {splits.some((s) => s.source === "rd" && !s.rdAccountId) && "Recurring deposit portion reduces proportionally across all RDs. "}
                         {splits.some((s) => s.source === "rd" && s.rdAccountId) && "Recurring deposit portion reduces the specific account chosen. "}
                         {splits.some((s) => s.source === "shares") && "Share-sale portion reduces the Shares row at the extrapolated (or overridden) price — proceeds cover the purchase directly, same as cash. "}
@@ -2982,13 +3139,16 @@ export default function InvestmentPlanner() {
                     })
                     .filter(Boolean);
 
-                // CDs are still tracked as one pooled balance going forward (growth + contributions),
-                // not each account's own trajectory, so a per-CD breakdown is only meaningful for
-                // today's snapshot. Recurring deposits, however, are tracked individually by the engine
-                // (see rdByAccount on each row), so their breakdown is accurate across every column.
+                // Both CDs/FDs and recurring deposits are now tracked account-by-account by the engine
+                // (see cdByAccount/rdByAccount on each row), so both breakdowns are accurate in every
+                // column, not just "Now". A liquidated (matured) CD naturally drops out — its value
+                // moved to Savings & Checking, memo'd via the "Deposit Liquidated" row above.
                 const cdChildren = cds
                   .filter((c) => num(c.amount) > 0)
-                  .map((c) => ({ label: c.label || "CD", get: (r) => (r.year === 0 ? num(c.amount) : null) }));
+                  .map((c) => ({
+                    label: c.label || (country === "India" ? "FD" : "CD"),
+                    get: (r) => r.cdByAccount?.find((x) => x.id === c.id)?.value ?? 0,
+                  }));
                 const rdChildren = recurringDeposits
                   .filter((rd) => summary.rdComputed.find((x) => x.id === rd.id))
                   .map((rd) => ({
@@ -3006,7 +3166,7 @@ export default function InvestmentPlanner() {
 
                 const assetRows = [
                   { type: "leaf", label: "Savings & Checking", get: (r) => r.liquid },
-                  { type: "group", key: "cds", label: "CDs", get: (r) => r.cds, children: cdChildren },
+                  { type: "group", key: "cds", label: country === "India" ? "FDs" : "CDs", get: (r) => r.cds, children: cdChildren },
                   { type: "group", key: "rd", label: "Recurring Deposits", get: (r) => r.rd, children: rdChildren },
                   { type: "leaf", label: "Shares", get: (r) => r.shares },
                   { type: "leaf", label: country === "India" ? "Provident Fund" : "401(k)", get: (r) => r.k401 },
@@ -3072,6 +3232,14 @@ export default function InvestmentPlanner() {
                           <td className="bs-row-label" colSpan={shown.length + 1}>Assets</td>
                         </tr>
                         {assetRows.map(renderRowGroup)}
+                        {shown.some((r) => r.depositsLiquidated > 0) && (
+                          <tr className="bs-child-row bs-memo-row">
+                            <td className="bs-row-label bs-child-label">{country === "India" ? "FD" : "CD"} Deposit Liquidated <em>(memo — already included in Savings &amp; Checking above)</em></td>
+                            {shown.map((r) => (
+                              <td key={r.year}>{r.depositsLiquidated > 0 ? money(r.depositsLiquidated) : "—"}</td>
+                            ))}
+                          </tr>
+                        )}
                         <tr className="bs-subtotal-row">
                           <td className="bs-row-label">Total Assets</td>
                           {shown.map((r) => (
@@ -3100,7 +3268,15 @@ export default function InvestmentPlanner() {
                 );
               })()}
               <p className="section-hint" style={{ marginTop: 10 }}>
-                Columns are thinned to a readable number when projecting many years — the last column is always the final projected year. Click CDs, Recurring Deposits, or Planned Big Items to expand or collapse the individual accounts/items behind that total. Individual CD balances are only shown for the "Now" column (a dash elsewhere) since CDs are tracked as one combined pool going forward; recurring deposits, by contrast, are tracked account-by-account at their own rate and contribution schedule, so their breakdown is accurate in every column and the category total is an exact sum of those accounts, not a separate approximation. {netWorthTablePayoffsApplied ? "The \"Now\" column and every column after reflect today's already-qualifying one-time actions (cash, CD, recurring deposit, and share payoffs), plus every future payoff proposal applied in the year it would trigger." : "This is the baseline path — no one-time or future payoff proposals have been applied yet. Use the button above to see the effect of acting on them."} Planned big items can be split across multiple funding sources by percentage (e.g. 20% cash, 80% new loan) — each split hits its own pool for its share of the amount, starting the year the item occurs (or immediately, if that year has already passed). Cash, CD, and recurring-deposit portions reduce that balance directly — a genuine draw-down inside the simulation, not just a display subtraction. Loan portions with a tenure entered amortize down to zero over that term, with the annual installment deducted from Savings & Checking each year of the term; without a tenure, the balance simply compounds with no payments modeled. Your emergency fund target holds steady in year 1, then grows {pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on. If a cash-, CD-, or RD-funded portion pulls a balance below that target, up to half of each subsequent year's cash flow surplus is redirected to refill it first — the same 50% cap the Suggested Monthly Allocation plan uses — before anything goes toward CDs or shares.
+                {(() => {
+                  const cd = country === "India" ? "FD" : "CD";
+                  const cds = country === "India" ? "FDs" : "CDs";
+                  return `Columns are thinned to a readable number when projecting many years — the last column is always the final projected year. Click ${cds}, Recurring Deposits, or Planned Big Items to expand or collapse the individual accounts/items behind that total. ${cds} and recurring deposits are both tracked account-by-account, each compounding at its own entered rate, so both breakdowns are accurate in every column and each category total is an exact sum of those accounts, not an approximation from a blended rate. A ${cd} with a start date and tenure matures on schedule — its full value (principal + accrued interest${country === "India" ? ", minus TDS" : ""}) moves to Savings & Checking that year, shown as a "${cd} Deposit Liquidated" memo row so it isn't invisible, without being double-counted in the total (it's already inside Savings & Checking by then). A ${cd} with no tenure set just compounds indefinitely with no maturity event. ${
+                    netWorthTablePayoffsApplied
+                      ? `The "Now" column and every column after reflect today's already-qualifying one-time actions (cash, ${cd}, recurring deposit, and share payoffs), plus every future payoff proposal applied in the year it would trigger.`
+                      : "This is the baseline path — no one-time or future payoff proposals have been applied yet. Use the button above to see the effect of acting on them."
+                  } Planned big items can be split across multiple funding sources by percentage (e.g. 20% cash, 80% new loan) — each split hits its own pool for its share of the amount, starting the year the item occurs (or immediately, if that year has already passed). Cash, ${cd}, and recurring-deposit portions reduce that balance directly — a genuine draw-down inside the simulation, not just a display subtraction. Loan portions with a tenure entered amortize down to zero over that term, with the annual installment deducted from Savings & Checking each year of the term; without a tenure, the balance simply compounds with no payments modeled. Your emergency fund target holds steady in year 1, then grows ${pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on. If a cash-, ${cd}-, or RD-funded portion pulls a balance below that target, up to half of each subsequent year's cash flow surplus is redirected to refill it first — the same 50% cap the Suggested Monthly Allocation plan uses — before anything goes toward ${cds} or shares.`;
+                })()}
               </p>
             </div>
           )}
@@ -3136,16 +3312,46 @@ export default function InvestmentPlanner() {
                 <Field label="Savings account balance">
                   <MoneyInput value={savings} onChange={setSavings} />
                 </Field>
-                <Field label="Checking account balance">
-                  <MoneyInput value={checking} onChange={setChecking} />
+                <Field
+                  label="Savings account interest rate"
+                  suffix={country === "India" ? "annual, most Indian banks pay 2.5–4%" : "annual, a competitive high-yield savings rate (not the ~0.4% sleepy average)"}
+                >
+                  <RateInput value={savingsInterestRate} onChange={setSavingsInterestRate} />
                 </Field>
               </div>
+              {country === "United States" && (
+                <div className="grid-2" style={{ marginTop: 14 }}>
+                  <Field label="Checking account balance">
+                    <MoneyInput value={checking} onChange={setChecking} />
+                  </Field>
+                </div>
+              )}
+              <p className="section-hint" style={{ marginTop: 8 }}>
+                {country === "India"
+                  ? "There's no checking-account equivalent in India's typical banking setup, so that field is left out entirely here."
+                  : "Checking is assumed to earn nothing, same as always — only the savings balance compounds at the rate above."}{" "}
+                The savings interest rate is used to grow your savings balance forward in the Net Worth Trajectory, instead of assuming it just sits flat.
+              </p>
 
-              <h2 className="section-title" style={{ marginTop: 22 }}>Certificates of deposit</h2>
-              <p className="section-hint">Add each CD with its amount and interest rate.</p>
-              {cds.map((c) => (
-                <RowShell key={c.id} onRemove={() => removeCd(c.id)}>
-                  <Field label="Label">
+              <h2 className="section-title" style={{ marginTop: 22 }}>{country === "India" ? "Fixed deposits" : "Certificates of deposit"}</h2>
+              <p className="section-hint">
+                Add each {country === "India" ? "FD" : "CD"} with its amount and interest rate. Start date and tenure are optional — leave tenure blank for an open-ended {country === "India" ? "FD" : "CD"} that just keeps compounding; fill it in for a real maturity date, at which point the full amount moves to Savings & Checking automatically in the Net Worth projection.
+              </p>
+              {country === "India" && (
+                <div className="grid-2" style={{ marginBottom: 14 }}>
+                  <Field label="TDS rate on FD interest" suffix="deducted from accrued interest at maturity">
+                    <RateInput value={fdTdsRate} onChange={setFdTdsRate} />
+                  </Field>
+                </div>
+              )}
+              {country === "India" && (
+                <p className="section-hint" style={{ marginTop: -6, marginBottom: 14 }}>
+                  Standard TDS on FD interest is 10% with PAN on file (20% without PAN), only above the exemption threshold per bank per year — this is a simplified flat rate applied to total accrued interest at maturity, not the more granular year-by-year deduction banks actually use.
+                </p>
+              )}
+              {summary.cdComputed.map((c) => (
+                <RowShell key={c.id} onRemove={() => removeCd(c.id)} gridClassName="shares-grid">
+                  <Field label="Label" className="full-width">
                     <input className="text-input" value={c.label} onChange={(e) => updateCd(c.id, "label", e.target.value)} />
                   </Field>
                   <Field label="Amount">
@@ -3154,9 +3360,49 @@ export default function InvestmentPlanner() {
                   <Field label="Interest rate">
                     <RateInput value={c.rate} onChange={(v) => updateCd(c.id, "rate", v)} />
                   </Field>
+                  <Field label="Start date">
+                    <input
+                      className="text-input"
+                      type="date"
+                      value={c.startDate || ""}
+                      onChange={(e) => updateCd(c.id, "startDate", e.target.value)}
+                    />
+                  </Field>
+                  <Field label="Tenure" suffix="blank = open-ended, no maturity">
+                    <input
+                      className="text-input"
+                      type="number"
+                      inputMode="numeric"
+                      min="0"
+                      value={c.tenureValue || ""}
+                      placeholder="e.g. 1"
+                      onChange={(e) => updateCd(c.id, "tenureValue", e.target.value)}
+                    />
+                  </Field>
+                  <Field label="Tenure unit">
+                    <select className="type-select" value={c.tenureUnit || "years"} onChange={(e) => updateCd(c.id, "tenureUnit", e.target.value)}>
+                      <option value="months">Months</option>
+                      <option value="years">Years</option>
+                    </select>
+                  </Field>
+                  <div className="holding-readout">
+                    {c.endDateObj ? (
+                      <>
+                        <span>Maturity date: <strong>{c.endDateObj.toLocaleDateString()}</strong></span>
+                        <span>Current value: <strong>{money(c.currentValue)}</strong></span>
+                        <span>
+                          Net maturity value: <strong>{money(c.netMaturityValue)}</strong>
+                          {country === "India" && c.maturityTds > 0 && <> (after {money(c.maturityTds)} TDS)</>}
+                        </span>
+                        {c.isMatured && <span className="fetch-note ok">Matured — liquidates to Savings & Checking in the projection</span>}
+                      </>
+                    ) : (
+                      <span>No tenure set — this {country === "India" ? "FD" : "CD"} compounds indefinitely with no maturity event.</span>
+                    )}
+                  </div>
                 </RowShell>
               ))}
-              <button className="add-btn" onClick={addCd}>+ Add another CD</button>
+              <button className="add-btn" onClick={addCd}>+ Add another {country === "India" ? "FD" : "CD"}</button>
 
               <h2 className="section-title" style={{ marginTop: 22 }}>Recurring deposits</h2>
               <p className="section-hint">Add each recurring deposit with its frequency, rate, periodic deposit, start date, and tenure. End date, current value, and maturity value are calculated automatically.</p>
@@ -3297,11 +3543,15 @@ export default function InvestmentPlanner() {
 
           {tab === "shares" && (
             <div>
-              <h2 className="section-title">Shares / brokerage holdings</h2>
-              <p className="section-hint">Enter a ticker and quantity, then look up the current price and dividend automatically — or type them in yourself.</p>
+              <h2 className="section-title">{country === "India" ? "Investments" : "Shares / brokerage holdings"}</h2>
+              <p className="section-hint">
+                {country === "India"
+                  ? "Enter a ticker (for shares) or scheme code (for mutual funds) and quantity/units, then look up the current price or NAV automatically — or type them in yourself."
+                  : "Enter a ticker and quantity, then look up the current price and dividend automatically — or type them in yourself."}
+              </p>
               <div className="shares-header-actions">
                 <label className="shares-upload-label">
-                  <span className="lookup-btn shares-upload-btn">Upload CSV (ticker, quantity)</span>
+                  <span className="lookup-btn shares-upload-btn">Upload CSV ({country === "India" ? "ticker/scheme code, quantity" : "ticker, quantity"})</span>
                   <input type="file" accept=".csv,text/csv" onChange={handleShareCsvUpload} style={{ display: "none" }} />
                 </label>
                 <button type="button" className="lookup-btn" disabled={lookupAllBusy || shares.every((h) => !h.ticker.trim())} onClick={lookupAllShares}>
@@ -3312,29 +3562,43 @@ export default function InvestmentPlanner() {
               </div>
               {shares.map((h) => {
                 const holdingValue = num(h.quantity) * num(h.price);
-                const quarterlyIncome = num(h.quantity) * num(h.dividendValue);
+                const isMutualFund = country === "India" && h.assetType === "mutualFund";
+                const quarterlyIncome = isMutualFund ? 0 : num(h.quantity) * num(h.dividendValue);
                 const status = fetchStatus[h.id];
                 return (
                   <RowShell key={h.id} onRemove={() => removeShare(h.id)} gridClassName="shares-grid">
-                    <Field label="Ticker" className="full-width">
+                    {country === "India" && (
+                      <Field label="Type">
+                        <select className="type-select" value={h.assetType || "share"} onChange={(e) => updateShare(h.id, "assetType", e.target.value)}>
+                          <option value="share">Share</option>
+                          <option value="mutualFund">Mutual Fund</option>
+                        </select>
+                      </Field>
+                    )}
+                    <Field label={isMutualFund ? "Scheme code" : "Ticker"} className={country === "India" ? "" : "full-width"}>
                       <div className="ticker-row">
                         <input
                           className="text-input"
                           value={h.ticker}
-                          onChange={(e) => updateShare(h.id, "ticker", e.target.value.toUpperCase())}
-                          placeholder="e.g. VOO"
+                          onChange={(e) => updateShare(h.id, "ticker", isMutualFund ? e.target.value.replace(/[^0-9]/g, "") : e.target.value.toUpperCase())}
+                          placeholder={isMutualFund ? "e.g. 119551" : "e.g. VOO"}
                         />
                         <button
                           type="button"
                           className="lookup-btn"
                           disabled={!h.ticker.trim() || status?.state === "loading"}
-                          onClick={() => lookupShare(h.id, h.ticker)}
+                          onClick={() => lookupShare(h.id, h.ticker, h.assetType)}
                         >
                           {status?.state === "loading" ? "…" : "Look up"}
                         </button>
+                        {isMutualFund && (
+                          <a href="https://www.mfapi.in/" target="_blank" rel="noopener noreferrer" className="lookup-btn scheme-search-link">
+                            Find scheme code ↗
+                          </a>
+                        )}
                       </div>
                     </Field>
-                    <Field label="Quantity">
+                    <Field label={isMutualFund ? "Units" : "Quantity"}>
                       <input
                         className="text-input"
                         type="number"
@@ -3344,15 +3608,18 @@ export default function InvestmentPlanner() {
                         onChange={(e) => updateShare(h.id, "quantity", e.target.value)}
                       />
                     </Field>
-                    <Field label="Market price / share">
+                    <Field label={isMutualFund ? "NAV / unit" : "Market price / share"}>
                       <MoneyInput value={h.price} onChange={(v) => updateShare(h.id, "price", v)} decimals={2} />
                     </Field>
-                    <Field label="Dividend per share" suffix="quarterly" className="full-width">
-                      <MoneyInput value={h.dividendValue} onChange={(v) => updateShare(h.id, "dividendValue", v)} decimals={2} />
-                    </Field>
+                    {!isMutualFund && (
+                      <Field label="Dividend per share" suffix="quarterly" className="full-width">
+                        <MoneyInput value={h.dividendValue} onChange={(v) => updateShare(h.id, "dividendValue", v)} decimals={2} />
+                      </Field>
+                    )}
                     <div className="holding-readout">
                       <span>Value: <strong>{money(holdingValue)}</strong></span>
-                      <span>Est. quarterly income: <strong>{moneyPrecise(quarterlyIncome)}</strong></span>
+                      {!isMutualFund && <span>Est. quarterly income: <strong>{moneyPrecise(quarterlyIncome)}</strong></span>}
+                      {isMutualFund && <span>Growth-option fund assumed — no periodic payout counted</span>}
                       {status?.state === "done" && <span className="fetch-note ok">✓ {status.message}</span>}
                       {status?.state === "error" && <span className="fetch-note err">{status.message}</span>}
                     </div>
@@ -3361,7 +3628,9 @@ export default function InvestmentPlanner() {
               })}
               <button className="add-btn" onClick={addShare}>+ Add another holding</button>
               <p className="section-hint" style={{ marginTop: 10 }}>
-                Look up checks free quote sites (stockanalysis.com, then Yahoo Finance) — the status line shows which one was actually used. Prices and dividends can still lag the real market, so treat them as a helpful starting point and double-check anything you're relying on.
+                {country === "India"
+                  ? "Shares look up via a server-side Yahoo Finance proxy (avoids the CORS restrictions a direct browser call would hit); mutual funds look up directly from MFAPI.in (a free, public, key-free API for Indian mutual fund NAVs) — use \"Find scheme code ↗\" next to a mutual fund holding if you don't know it offhand. Uploaded CSV rows are auto-detected: a purely numeric first column is treated as a scheme code, anything else as a ticker."
+                  : "Looks up the current price and dividend from Finnhub, via your own server-side Edge Function (keeps the API key off the client and avoids any browser CORS restrictions)."}
               </p>
 
               <div className="grid-2" style={{ marginTop: 22 }}>
@@ -3413,6 +3682,9 @@ export default function InvestmentPlanner() {
               <h2 className="section-title">Monthly household expenses</h2>
               <p className="section-hint">Everyday spending, excluding mortgage and loan payments (captured elsewhere).</p>
               <div className="grid-2">
+                <Field label="Rent" suffix="if renting rather than owning">
+                  <MoneyInput value={expenses.rent} onChange={(v) => updateExpense("rent", v)} />
+                </Field>
                 <Field label="Utilities"><MoneyInput value={expenses.utilities} onChange={(v) => updateExpense("utilities", v)} /></Field>
                 <Field label="Groceries"><MoneyInput value={expenses.groceries} onChange={(v) => updateExpense("groceries", v)} /></Field>
                 <Field label="Dining out"><MoneyInput value={expenses.dining} onChange={(v) => updateExpense("dining", v)} /></Field>
@@ -3648,7 +3920,15 @@ export default function InvestmentPlanner() {
                   {netWorthTablePayoffsApplied ? "↺ Reset to baseline (no payoffs applied)" : "↻ Recalculate with recommended payoffs"}
                 </button>
                 <p className="alloc-note" style={{ marginTop: 8 }}>
-                  Up to half of each year's cash flow surplus tops up your emergency fund first if a big planned expense (or anything else) has pulled cash below target — same 50% cap as the Suggested Monthly Allocation plan. That target holds steady in year 1, then grows {pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on, rather than staying a fixed dollar figure forever. The rest of the surplus (all of it, once the fund is full) splits 70/30 between retirement investing (shares) and CDs/short-term savings. CDs grow at your {pct(num(marketCdRate))}/yr market rate (new money earns today's rate, regardless of what any existing CDs happen to carry), shares at {pct(summary.totalExpectedReturn)}/yr plus that contribution, and property at {pct(netWorthTableTrajectory.apprRate)}/yr appreciation, while amortizing mortgages and loans that have a rate on file. Each recurring deposit compounds individually at its own rate and keeps receiving its own annual contribution (monthly deposit × 12) until its own maturity date, then stops — the Recurring Deposits total is an exact sum of every account's own trajectory, not a single blended rate applied to a combined pool. Your {country === "India" ? "Provident Fund" : "401(k)"} grows at {pct(summary.k401GrowthPct)}/yr plus its own annual contribution (growing at {pct(summary.k401ContributionGrowthPct)}/yr) — unlike the Retirement Readiness simulation, this trajectory has no fixed retirement year, so that contribution is assumed to continue for the full projection. {netWorthTablePayoffsApplied ? "Today's already-qualifying one-time actions (cash, CD, recurring deposit, and share payoffs) are applied right at the start, and future payoff proposals are applied in the year they'd trigger — each reducing both that debt and the asset used." : "This is the baseline path — no one-time or future payoff proposals are applied yet; toggle the button above to see their effect."} This toggle is shared with the Net Worth tab's table. A simplification — real contributions, rates, and returns will vary year to year.
+                  {(() => {
+                    const cd = country === "India" ? "FD" : "CD";
+                    const cds = country === "India" ? "FDs" : "CDs";
+                    return `Up to half of each year's cash flow surplus tops up your emergency fund first if a big planned expense (or anything else) has pulled cash below target — same 50% cap as the Suggested Monthly Allocation plan. That target holds steady in year 1, then grows ${pct(summary.expenseGrowthPct)}/yr with expense inflation from year 2 on, rather than staying a fixed dollar figure forever. Your savings balance itself also compounds at ${pct(num(savingsInterestRate))}/yr${country !== "India" && num(checking) > 0 ? " (checking stays flat, so this applies to roughly the savings share of your liquid cash)" : ""}. The rest of the surplus (all of it, once the fund is full) splits 70/30 between retirement investing (shares) and ${cds}/short-term savings. Each existing ${cd} compounds at its own entered rate — not a blended market rate — and, if it has a start date and tenure, matures and liquidates to Savings & Checking on schedule (principal + interest${country === "India" ? ", minus TDS" : ""}); ongoing surplus that isn't yet in a specific ${cd} builds a separate pool at today's ${pct(num(marketCdRate))}/yr market rate, standing in for new ${cds} opened over time. Shares grow at ${pct(summary.totalExpectedReturn)}/yr plus that contribution, and property at ${pct(netWorthTableTrajectory.apprRate)}/yr appreciation, while amortizing mortgages and loans that have a rate on file. Each recurring deposit compounds individually at its own rate and keeps receiving its own annual contribution (monthly deposit × 12) until its own maturity date, then stops — the Recurring Deposits total is an exact sum of every account's own trajectory, not a single blended rate applied to a combined pool. Your ${country === "India" ? "Provident Fund" : "401(k)"} grows at ${pct(summary.k401GrowthPct)}/yr plus its own annual contribution (growing at ${pct(summary.k401ContributionGrowthPct)}/yr) — unlike the Retirement Readiness simulation, this trajectory has no fixed retirement year, so that contribution is assumed to continue for the full projection. ${
+                      netWorthTablePayoffsApplied
+                        ? `Today's already-qualifying one-time actions (cash, ${cd}, recurring deposit, and share payoffs) are applied right at the start, and future payoff proposals are applied in the year they'd trigger — each reducing both that debt and the asset used.`
+                        : "This is the baseline path — no one-time or future payoff proposals are applied yet; toggle the button above to see their effect."
+                    } This toggle is shared with the Net Worth tab's table. A simplification — real contributions, rates, and returns will vary year to year.`;
+                  })()}
                 </p>
                 <div className="projection-rows nwt-rows">
                   {netWorthTableTrajectory.rows
@@ -3676,19 +3956,19 @@ export default function InvestmentPlanner() {
             </div>
             <div className="alloc-legend">
               <span><i className="dot equity" /> Growth (shares) target {pct(summary.targetEquityPct)}</span>
-              <span><i className="dot fixed" /> Stable (CDs/cash) target {pct(summary.targetFixedPct)}</span>
+              <span><i className="dot fixed" /> Stable ({country === "India" ? "FDs" : "CDs"}/cash) target {pct(summary.targetFixedPct)}</span>
             </div>
             {summary.investablePortfolio > 0 ? (
               <p className="alloc-note">
-                Right now your CDs + shares are split {pct(summary.currentEquityPct)} growth / {pct(summary.currentFixedPct)} stable.
+                Right now your {country === "India" ? "FDs" : "CDs"} + shares are split {pct(summary.currentEquityPct)} growth / {pct(summary.currentFixedPct)} stable.
                 {Math.abs(summary.allocationGapPct) > 8
                   ? summary.allocationGapPct > 0
                     ? " New contributions could lean toward shares/index funds to move closer to your target."
-                    : " New contributions could lean toward CDs or fixed income to move closer to your target."
+                    : ` New contributions could lean toward ${country === "India" ? "FDs" : "CDs"} or fixed income to move closer to your target.`
                   : " That's reasonably close to your target mix already."}
               </p>
             ) : (
-              <p className="alloc-note">Add CD or share balances to compare against this target.</p>
+              <p className="alloc-note">Add {country === "India" ? "FD" : "CD"} or share balances to compare against this target.</p>
             )}
 
             <div className="divider-label">Retirement readiness</div>
@@ -3700,7 +3980,7 @@ export default function InvestmentPlanner() {
               <span>{pct(summary.fiProgressPct)} of {money(summary.fiNumber)} FI number</span>
             </div>
             <p className="alloc-note">
-              FI number = {money(summary.annualRetirementExpense)}/yr ÷ {pct(summary.withdrawalRatePct)} withdrawal rate{summary.ssMonthlyAtFRA > 0 ? `, net of an estimated after-tax ${country === "India" ? "pension" : "Social Security"} benefit (taxed at ${pct(summary.ssTaxRatePct)})` : ""}, and it grows {pct(summary.expenseGrowthPct)}/yr with your expense growth assumption. Counting liquid cash + CDs + recurring deposits + shares{summary.k401Now > 0 ? ` + ${money(summary.k401Now)} in ${country === "India" ? "Provident Fund" : "401(k)"}` : ""} (not home equity).
+              FI number = {money(summary.annualRetirementExpense)}/yr ÷ {pct(summary.withdrawalRatePct)} withdrawal rate{summary.ssMonthlyAtFRA > 0 ? `, net of an estimated after-tax ${country === "India" ? "pension" : "Social Security"} benefit (taxed at ${pct(summary.ssTaxRatePct)})` : ""}, and it grows {pct(summary.expenseGrowthPct)}/yr with your expense growth assumption. Counting liquid cash + {country === "India" ? "FDs" : "CDs"} + recurring deposits + shares{summary.k401Now > 0 ? ` + ${money(summary.k401Now)} in ${country === "India" ? "Provident Fund" : "401(k)"}` : ""} (not home equity).
               {summary.hasTargetAge ? (
                 <>
                   {" "}At age {summary.estRetirementAge} ({summary.yearsToFI} {summary.yearsToFI === 1 ? "year" : "years"} away), expected expenses net of
@@ -3757,7 +4037,7 @@ export default function InvestmentPlanner() {
                   </label>
                 </div>
                 <p className="alloc-note" style={{ marginTop: 8 }}>
-                  Projects your CD, recurring deposit, and share balances forward (starting from what's left after any actions above) to find the first month each pool crosses your {money(summary.payoffThresholdAmt)} minimum — then proposes liquidating it against the highest-rate qualifying debt at that time, same rule as today's actions. Amounts and dates are projections, not guarantees.
+                  Projects your {country === "India" ? "FD" : "CD"}, recurring deposit, and share balances forward (starting from what's left after any actions above) to find the first month each pool crosses your {money(summary.payoffThresholdAmt)} minimum — then proposes liquidating it against the highest-rate qualifying debt at that time, same rule as today's actions. Amounts and dates are projections, not guarantees.
                 </p>
                 {summary.futurePayoffProjection.length === 0 ? (
                   <p className="empty-plan">No future payoff crosses your {money(summary.payoffThresholdAmt)} threshold within 30 years at current growth assumptions.</p>
@@ -3781,7 +4061,7 @@ export default function InvestmentPlanner() {
               <>
                 <div className="divider-label">Liquidate shares vs. pay off debt — {summary.projYears}-yr outlook</div>
                 <p className="alloc-note" style={{ marginTop: 0 }}>
-                  Comparing each debt's rate against your {pct(summary.totalExpectedReturn)}/yr expected total return (price growth + dividend yield). Balances shown are what's left after any cash/CD paydown above.
+                  Comparing each debt's rate against your {pct(summary.totalExpectedReturn)}/yr expected total return (price growth + dividend yield). Balances shown are what's left after any cash/{country === "India" ? "FD" : "CD"} paydown above.
                 </p>
                 {summary.restructureAnalysis.map((r, i) => {
                   const isOpen = explainOpenKey === i;
@@ -3820,7 +4100,7 @@ export default function InvestmentPlanner() {
                           <div className="explain-row">
                             <span className="explain-label">1. Remaining balance</span>
                             <p>
-                              {money(r.balance)} is what's left on this {r.kind === "mortgage" ? "mortgage" : "loan"} after any excess cash and CD funds were already applied in the steps above — this comparison only runs on what's still outstanding.
+                              {money(r.balance)} is what's left on this {r.kind === "mortgage" ? "mortgage" : "loan"} after any excess cash and {country === "India" ? "FD" : "CD"} funds were already applied in the steps above — this comparison only runs on what's still outstanding.
                             </p>
                           </div>
                           <div className="explain-row">
